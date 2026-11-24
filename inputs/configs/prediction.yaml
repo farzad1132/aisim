@@ -1,0 +1,12 @@
+engine:
+  mode: aggregated
+  model: Qwen/Qwen3-32B-FP8
+  hardware: h200_sxm
+  backend: vllm
+  workers:
+    aggregated: {}
+  
+traffic:
+  source: {type: synthetic, input_tokens: 1024, output_tokens: 128}
+  load: {type: concurrency, concurrency: 10}
+  stop: {requests: 100}
