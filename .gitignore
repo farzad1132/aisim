@@ -23,3 +23,6 @@ htmlcov/
 
 # Rust build output
 target/
+
+# Per-run results written by aisim-run.sh
+/results/
