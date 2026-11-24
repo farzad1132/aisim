@@ -1,10 +1,21 @@
 engine:
   mode: aggregated
-  model: Qwen/Qwen3-32B-FP8
-  hardware: h200_sxm
+  model: google/gemma-4-26B-A4B
+  hardware: rtx_pro_6000_server
   backend: vllm
+  backend_version: "0.32.0"
+  # npcpd-agg4a: FP8 W8A8 checkpoint, --kv-cache-dtype fp8, --max-model-len 131072
+  gemm_quant_mode: fp8
+  moe_quant_mode: fp8
+  kvcache_quant_mode: fp8
+  context_length: 131072
+  # npcpd-agg4a runs TRITON_ATTN. MoE stays on default: the 0.32.0 data has no
+  # Triton kernel for ModelOpt FP8 MoE, so AISim uses FlashInfer CUTLASS timings.
+  attention_backend: triton
   workers:
-    aggregated: {}
+    aggregated:
+      scheduler:
+        max_batched_tokens: 4096  # --max-num-batched-tokens
   
 traffic:
   source: {type: synthetic, input_tokens: 1024, output_tokens: 128}
