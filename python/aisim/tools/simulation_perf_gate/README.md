@@ -147,7 +147,7 @@ required. The selector verifies that the trusted copy matches the current PR hea
 Revision and protocol checks run in the hosted selection job. A two-entry build
 matrix builds base and head in parallel with the same container, Python, Rust,
 and release settings. Each side also builds Dynamo at
-`def3b79b15c266805540a678dd400aeb6ccada1d`, with both AISim dependencies
+`df666fbc6284e540ea0f5cac613da7f992b1fc7b`, with both AISim dependencies
 pointing at that side's exact source. Cargo resolves the local core's dependency
 graph from Dynamo's existing lock before compilation. The wheel build uses
 `--locked` with that resolved graph. Additional offline

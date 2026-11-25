@@ -442,7 +442,8 @@ eviction rules G2 follows:
 | A hit before its load | Not pinned | Not pinned | Pinned until the request loads it or looks it up again |
 | G1 blocks being copied | Freed with their request; a new owner waits for the copy | The same | Held until the copy completes, then freed first block first |
 | A preemption | Waits for the preempted request's stores | The same | Waits for every transfer in flight |
-| A waiting request that holds G1 for its load | Keeps its place among the requests that have waited on G2, unless the rank has G3 or has pulled over KVCR | Once its load lands, is admitted before every waiting request that holds none | The same |
+| A waiting request that holds G1 for its load | Keeps its place among the requests that have waited on G2, unless the rank has G3 or has pulled over KVCR | Once its load lands (with [`launch`](workers.md#vllm-pass-launch), once vLLM has seen it), is admitted before every waiting request that holds none | The same |
+| A completed load, with [`launch`](workers.md#vllm-pass-launch) | Seen when its copy ends | On a busy rank, seen by the first later launch that ends at or after the copy; schedulable two passes later. When the restore is the rank's only work, replay's zero-cost empty steps make it schedulable when the copy ends. The copy waits for the issuing pass's GPU work. | The same busy-polling delay and idle completion rule, but the copy starts when the issuing pass's launch ends |
 
 On a decode rank with G2, or while a destination reservation is pending, an
 activated handoff is admitted before a fresh G2 restore, including one whose

@@ -160,6 +160,12 @@ aggregated replay with attention DP1 only; a single logical worker with DP2
 is still rejected. Multiworker/P/D/scaling consumers use normal reports
 and neutral observation contracts.
 
+With vLLM `launch` and a polled v0.32 CPU-tier connector, replay records a
+`load_queued` event in `ReplayArtifacts.host_offload_events` when it prices
+the issuing pass. The record can follow store events from that pass.
+`observed_at_ms` retains the load's queue time and `completes_at_ms` gives
+the physical copy completion time, including the replay clock floor.
+
 `with_telemetry_observer(interval_ms, observer)` requires a positive finite
 interval and returns `ReplayResult<Self>`. The observer receives a baseline,
 settled interval samples, and a final tail when needed. A sample coinciding

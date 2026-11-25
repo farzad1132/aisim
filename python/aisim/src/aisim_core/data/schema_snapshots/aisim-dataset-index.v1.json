@@ -113,7 +113,8 @@
           "fpm",
           "e2e",
           "eval",
-          "systems"
+          "systems",
+          "host-cost"
         ]
       },
       "title": "Categories",

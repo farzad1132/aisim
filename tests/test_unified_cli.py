@@ -3348,6 +3348,11 @@ def test_empty_telemetry_streams_are_written_with_zero_counts(tmp_path):
     assert all((tmp_path / name).read_text() == "" for name in manifest["artifacts"].values())
 
 
+def test_telemetry_rows_are_compact_json_lines_with_sorted_keys(tmp_path):
+    write_telemetry(tmp_path, {**_telemetry_payload(), "lifecycle": [{"b": 1.5, "a": "x"}, {"c": None}]})
+    assert (tmp_path / "telemetry-lifecycle.jsonl").read_bytes() == b'{"a":"x","b":1.5}\n{"c":null}\n'
+
+
 @pytest.mark.parametrize("invalid", [None, {}, [1], ["bad"]])
 def test_telemetry_validates_all_streams_before_writing(tmp_path, invalid):
     payload = {**_telemetry_payload(), "lifecycle": invalid}

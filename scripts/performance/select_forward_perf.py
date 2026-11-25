@@ -17,6 +17,7 @@ from pathlib import Path
 PATH_PATTERNS = (
     ".github/workflows/performance.yml",
     "scripts/performance/select_forward_perf.py",
+    "scripts/performance/prefetch_op_latency.py",
     "Cargo.toml",
     "Cargo.lock",
     "crates/core/Cargo.toml",

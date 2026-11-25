@@ -959,6 +959,7 @@ impl G2Connector {
                 reranks_at_finish: false,
                 preemption_waits_for_all: false,
                 admits_kv_holders_first: false,
+                polled_load_start: None,
             },
             Self::OffloadingV032 => ConnectorRules {
                 policy: HostPolicy::Ranked,
@@ -974,6 +975,7 @@ impl G2Connector {
                 reranks_at_finish: true,
                 preemption_waits_for_all: false,
                 admits_kv_holders_first: true,
+                polled_load_start: Some(LoadCopyStart::PassEnd),
             },
             Self::SimpleCpuV032 => ConnectorRules {
                 policy: HostPolicy::FreeQueue,
@@ -989,6 +991,7 @@ impl G2Connector {
                 reranks_at_finish: false,
                 preemption_waits_for_all: true,
                 admits_kv_holders_first: true,
+                polled_load_start: Some(LoadCopyStart::LaunchEnd),
             },
         }
     }
@@ -1036,6 +1039,23 @@ pub(crate) struct ConnectorRules {
     /// before every other waiter (`kv_holding_waiting`). Otherwise skipped
     /// requests keep the order of their first skip (`skipped_waiting`).
     pub(crate) admits_kv_holders_first: bool,
+    /// Under `launch`, a finished load waits for a later pass to poll the
+    /// connector, and its copy starts at this point of the pass that issued
+    /// it. `None`: the load is seen when its copy ends.
+    pub(crate) polled_load_start: Option<LoadCopyStart>,
+}
+
+/// When a load's copy starts, relative to the pass that issued it. The
+/// connector submits it after the pass's launch, in vLLM's post-forward, and
+/// runs copies one at a time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LoadCopyStart {
+    /// When the launch ends: a copy thread copies the pass's loads as one
+    /// batch, without waiting for compute, and reports them together.
+    LaunchEnd,
+    /// When the pass's GPU work ends: each load is its own copy on a stream
+    /// that waits for compute.
+    PassEnd,
 }
 
 const DEFAULT_SHARED_HOST_OFFLOAD_BANDWIDTH_GBPS: f64 = 80.0;
@@ -1169,7 +1189,10 @@ impl NativeHostOffloadConfig {
 ///
 /// vLLM decides and launches pass k+1 before it returns pass k's outputs, so a
 /// pass's outputs leave once the next pass is launched, and a request joins the
-/// first pass decided after it arrives.
+/// first pass decided after it arrives. With an `offloading_v0_32` or
+/// `simple_cpu_v0_32` CPU tier, a finished load is admitted only after vLLM
+/// (Model Runner V2) polls the connector. With MTP and G2, launch timing
+/// requires a recurrent state cache and `disable_eagle_block_drop`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PassLaunchConfig {
@@ -1329,7 +1352,8 @@ pub struct EngineConfig {
     pub prefill_decode_interval: usize,
     /// vLLM `--async-scheduling`. The engine then keeps a second batch queued
     /// behind the running one, which a request arriving at a busy engine
-    /// misses. `None` selects vLLM's default: on, except with ngram drafts.
+    /// misses. Replay defaults to async scheduling unless it uses ngram drafts
+    /// or combines MTP and G2 host offload without a recurrent state cache.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub async_scheduling: Option<bool>,
     /// vLLM async scheduling's CPU launch costs: a pass's outputs leave once
@@ -1338,6 +1362,8 @@ pub struct EngineConfig {
     /// A rank holds the outputs until the driver releases them through
     /// `GeneralizedMockerEngine::take_due_emissions`, as offline replay does;
     /// other drivers must leave this unset.
+    /// With `offloading_v0_32` or `simple_cpu_v0_32`, Model Runner V2 polls
+    /// for completed loads. See [`PassLaunchConfig`] for the MTP restriction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch: Option<PassLaunchConfig>,
     /// Whether complete blocks remain reusable after request release.
@@ -4418,6 +4444,16 @@ mod tests {
             (
                 (|config: &mut EngineConfig| config.async_scheduling = Some(false))
                     as fn(&mut EngineConfig),
+                "launch requires vLLM async_scheduling",
+            ),
+            (
+                |config| {
+                    config.kv_cache_bytes_per_token = Some(128);
+                    config.native_host_offload = Some(
+                        NativeHostOffloadConfig::new(8).with_connector(G2Connector::OffloadingV032),
+                    );
+                    set_canonical_mtp(config, 2);
+                },
                 "launch requires vLLM async_scheduling",
             ),
             (

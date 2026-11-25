@@ -1,0 +1,66 @@
+{
+  "$id": "aisim-host-cost/v1",
+  "additionalProperties": false,
+  "description": "One timed request. Times are milliseconds, the median over the repeats of that request.",
+  "properties": {
+    "body_kb": {
+      "minimum": 0,
+      "title": "Body Kb",
+      "type": "number"
+    },
+    "encode_ms": {
+      "minimum": 0,
+      "title": "Encode Ms",
+      "type": "number"
+    },
+    "hash_ms": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Hash Ms"
+    },
+    "json_ms": {
+      "minimum": 0,
+      "title": "Json Ms",
+      "type": "number"
+    },
+    "request": {
+      "minimum": 0,
+      "title": "Request",
+      "type": "integer"
+    },
+    "template_ms": {
+      "minimum": 0,
+      "title": "Template Ms",
+      "type": "number"
+    },
+    "tokens": {
+      "exclusiveMinimum": 0,
+      "title": "Tokens",
+      "type": "integer"
+    },
+    "validate_ms": {
+      "minimum": 0,
+      "title": "Validate Ms",
+      "type": "number"
+    }
+  },
+  "required": [
+    "request",
+    "tokens",
+    "body_kb",
+    "json_ms",
+    "validate_ms",
+    "template_ms",
+    "encode_ms"
+  ],
+  "title": "HostCostRow",
+  "type": "object"
+}

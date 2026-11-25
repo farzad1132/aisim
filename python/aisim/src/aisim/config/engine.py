@@ -174,8 +174,8 @@ class SchedulerPredictionConfig(StrictModel):
         default=None,
         description=(
             "vLLM only: model vLLM's --async-scheduling, under which an arrival at a busy engine misses the "
-            "batch vLLM has already queued. Unset uses vLLM's default: on, except with ngram drafts "
-            "or MTP with G2 host offload."
+            "batch vLLM has already queued. Replay defaults to async scheduling unless it uses ngram drafts "
+            "or combines MTP and G2 host offload without a recurrent state cache."
         ),
     )
     load_balance_method: Literal["round_robin", "total_tokens"] = Field(
@@ -189,7 +189,10 @@ class SchedulerPredictionConfig(StrictModel):
         default=None,
         description=(
             "vLLM aggregated workers with async scheduling only: CPU launch costs of vLLM's engine loop. A pass's "
-            "outputs then leave once the next pass is launched, and an arrival joins the first pass decided after it."
+            "outputs then leave once the next pass is launched, and an arrival joins the first pass decided after it. "
+            "With an offloading_v0_32 or simple_cpu_v0_32 CPU tier, a finished load is admitted only after vLLM "
+            "(Model Runner V2) polls the connector. With MTP and G2, launch timing requires a recurrent state cache "
+            "and disable_eagle_block_drop=true."
         ),
     )
 
@@ -1059,6 +1062,17 @@ class TokenizationConfig(StrictModel):
     per_input_token_us: NonNegativeFloat = 0.0
 
 
+class ExtraCpuOverheadConfig(StrictModel):
+    """Unqueued serving-path CPU time before the engine: HTTP receive and first-chunk work."""
+
+    base_ms: NonNegativeFloat = 0.0
+    per_input_token_us: NonNegativeFloat = 0.0
+
+    @property
+    def active(self) -> bool:
+        return bool(self.base_ms or self.per_input_token_us)
+
+
 class DetokenizationConfig(StrictModel):
     workers: PositiveInt = 1
     base_ms: NonNegativeFloat = 0.0
@@ -1239,6 +1253,7 @@ class EnginePredictionConfig(EstimatorPolicyConfig):
     workers: WorkersPredictionConfig = Field(default_factory=WorkersPredictionConfig)
     kv_transfer: KvTransferConfig | None = None
     tokenization: TokenizationConfig | None = None
+    extra_cpu_overhead: ExtraCpuOverheadConfig | None = None
     detokenization: DetokenizationConfig | None = None
 
     @field_validator("model", "hardware")
@@ -1270,19 +1285,25 @@ class EnginePredictionConfig(EstimatorPolicyConfig):
         _validate_worker_hardware(modes={self.mode}, workers=self.workers)
         if self.tokenization is not None and (has_afd(self.workers) or self.workers.encoder is not None):
             raise ValueError("engine.tokenization requires token replay; AFD and analytical EPD are unsupported")
+        extra_cpu_overhead_active = self.extra_cpu_overhead is not None and self.extra_cpu_overhead.active
+        if extra_cpu_overhead_active and (has_afd(self.workers) or self.workers.encoder is not None):
+            raise ValueError("engine.extra_cpu_overhead requires token replay; AFD and analytical EPD are unsupported")
         if (
             self.detokenization is not None
             and self.detokenization.active
             and (has_afd(self.workers) or self.workers.encoder is not None)
         ):
             raise ValueError("engine.detokenization requires token replay; AFD and analytical EPD are unsupported")
-        if self.tokenization is not None and any(
+        if (self.tokenization is not None or extra_cpu_overhead_active) and any(
             worker is not None
             and not is_afd_worker(worker)
             and (worker.frontend is not None or worker.host_profile is not None)
             for worker in (self.workers.aggregated, self.workers.prefill)
         ):
-            raise ValueError("engine.tokenization and SGLang frontend stages both price request tokenization; use one")
+            raise ValueError(
+                "engine.tokenization, engine.extra_cpu_overhead and SGLang frontend stages all price "
+                "request-path CPU time; use one"
+            )
         _validate_afd_workers(self)
         _validate_worker_roles(modes={self.mode}, workers=self.workers, has_transfer=self.kv_transfer is not None)
         _validate_decode_radix_cache(

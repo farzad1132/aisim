@@ -61,3 +61,32 @@ def test_aliased_scalars_are_scanned_once_per_field_context(monkeypatch, context
     assert len(parsed) == 2  # once under the anchor's own key, once for the aliases' shared context
     # An alias under ``image`` still gets the image-field check; the same scalar under another field does not.
     assert ("image-name" in {f.code for f in findings}) is (context == "image")
+
+
+@pytest.mark.parametrize(
+    ("value", "code"),
+    [
+        ({"hostname": "gpu-node-17"}, "cluster-detail"),
+        ({"host": {"slurm_job_id": "2744440"}}, "cluster-detail"),
+        ({"host": {"hostnames": ["gpu-node-17"]}}, "cluster-detail"),
+        ({"source": {"job_ids": "2744440,2744442"}}, "cluster-detail"),
+        ({"load_average_1m": [15.5, 23.4]}, "cluster-detail"),
+        ({"note": "ran on nsc-svg-slurm-1-gpu-50"}, "internal-host"),
+        ({"model": "/workspace/tokenization-cost/tokenizers/deepseek"}, "local-path"),
+        ({"path": "/lustre/fsw/models/qwen"}, "local-path"),
+    ],
+)
+def test_cluster_hosts_job_ids_and_local_paths_are_refused(value, code):
+    assert code in {f.code for f in scan_value(value, DEFAULT_POLICY, "p", "w")}
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"model": "deepseek-ai/DeepSeek-V3", "source": "slurm", "cpu_model": "INTEL(R) XEON(R) PLATINUM 8568Y+"},
+        {"path": "data/host-cost/vllm/0.31.0/b200_sxm/qwen2/requests.parquet"},
+        {"slurm_topology_verified": "true"},
+    ],
+)
+def test_public_identifiers_and_dataset_paths_pass(value):
+    assert not scan_value(value, DEFAULT_POLICY, "p", "w")

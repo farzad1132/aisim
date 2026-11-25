@@ -16,6 +16,7 @@ FILES = {
     "scripts/performance/build_simulation_dynamo.py",
     "scripts/performance/check_dynamo_callback.py",
     "scripts/performance/dynamo_callback_contract.rs",
+    "scripts/performance/prefetch_op_latency.py",
     "scripts/performance/simulation_dynamo_requirements.in",
     "scripts/performance/simulation_dynamo_requirements.txt",
     "scripts/performance/select_forward_perf.py",

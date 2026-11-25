@@ -68,7 +68,7 @@ domains instead of the single values above; see
 
 | Block | Page |
 | --- | --- |
-| `engine.mode`, `model`, `hardware`, `backend`, `backend_version`, `context_length`, `workers` roles, `tokenization`, `detokenization` | [This page](#deployment-fields) |
+| `engine.mode`, `model`, `hardware`, `backend`, `backend_version`, `context_length`, `workers` roles, `tokenization`, `extra_cpu_overhead`, `detokenization` | [This page](#deployment-fields) |
 | `engine.workers.<role>.{hardware, startup_seconds, parallelism, scheduler}`, `engine.enable_chunked_prefill` | [Workers](workers.md) |
 | `engine.workers.<role>.kv_cache` | [KV cache](kv-cache.md) |
 | `engine.kv_transfer` | [P/D KV transfer](kv-transfer.md) |
@@ -111,6 +111,7 @@ Field tables on these pages use the following columns:
 | `engine.workers` | Required | Per mode | Role mappings; see [Worker roles](#worker-roles). A role may be `{}` to use all defaults. |
 | `engine.ais_perf_model` | Unset | fixed | One perf-model config, or a list with one config per worker type. Sets the estimator of each worker and replaces the deprecated estimator fields; see [Perf model](#ais-perf-model). Rejected with AFD, an encoder pool, and `fixed` or `polynomial` timing. |
 | `engine.tokenization` | Unset (off) | predict only | Optional `workers` (positive integer, default `1`), `base_ms` and `per_input_token_us` (finite and non-negative, default `0`). Tokenizes each request on its worker before the engine; see [Request tokenization](#tokenization). Aggregated and disaggregated token replay on `--stack engine` only; online replay, worker scaling, AFD, encoder pools and SGLang frontend stages (which already price the tokenizer) are rejected. |
+| `engine.extra_cpu_overhead` | Unset (off) | predict only | Optional `base_ms` and `per_input_token_us` (finite and non-negative, default `0`). Delays every request before the engine by `base_ms + per_input_token_us × input tokens` without queueing; see [Extra CPU overhead](#extra-cpu-overhead). Same replay support and rejections as `engine.tokenization`. |
 | `engine.detokenization` | Unset (off) | predict only | Optional `workers` (positive integer, default `1`), `base_ms` and `per_output_us` (finite and non-negative, default `0`). Detokenizes each pass's outputs on the worker that emits tokens before the client receives them; see [Response detokenization](#detokenization). Aggregated and disaggregated token replay on `--stack engine` only; online replay, worker scaling, AFD, encoder pools and `traffic.load.agentic_profile` are rejected. |
 
 <a id="tokenization"></a>
@@ -140,6 +141,10 @@ worker's engine. Servers are taken first come, first served.
   reach the engine in arrival order.
 - With more workers, a short prompt can finish before a long one that arrived
   earlier and reach the engine first.
+
+Measured per-token costs by framework, tokenizer and host CPU are in the
+[host-cost data](../../reference/host-cost-schema.md); there is no default for a deployment that has not been
+measured.
 
 Without this block, requests reach each engine at their arrival time, and
 requests that arrive together keep their authored order; see
@@ -173,6 +178,36 @@ are only an illustration.
   the request never reaches the engine. Its tokenizer time stays reserved,
   so requests behind it on that worker are not released earlier.
 - Setting both costs to `0` is the same as omitting the block.
+
+<a id="extra-cpu-overhead"></a>
+
+## Extra CPU overhead
+
+The serving path spends host-CPU time besides tokenization before a request
+reaches the scheduler: receiving the HTTP body, input processing, and work
+that precedes the first streamed chunk. `engine.extra_cpu_overhead` models it
+on the same workers as [tokenization](#tokenization). AISim has no default for
+it: set it from a measurement of your deployment. The values below are only an
+illustration.
+
+```yaml
+engine:
+  tokenization:
+    per_input_token_us: 1.5
+  extra_cpu_overhead:
+    base_ms: 30
+    per_input_token_us: 0.25
+```
+
+- A request is released `base_ms + per_input_token_us × input tokens` after
+  its tokenizer finishes (or after it arrives, without `engine.tokenization`).
+- The delay never queues: it does not occupy a tokenizer server, so every
+  request pays the same amount whatever the load. Put queued per-token work in
+  `engine.tokenization` and the rest here.
+- Latency metrics still start at arrival, a request holds its concurrency slot
+  while delayed, and both costs `0` is the same as omitting the block.
+- Like tokenization, it is a replay stage in front of the engine, not part of
+  the forward-pass estimator: it does not change `estimate_forward_pass_time_ms`.
 
 <a id="detokenization"></a>
 

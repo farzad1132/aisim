@@ -3866,6 +3866,77 @@ def test_prediction_compiler_carries_tokenization(tokenization, expected) -> Non
 
 
 @pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        (None, None),
+        ({}, None),
+        ({"base_ms": 0, "per_input_token_us": 0}, None),
+        ({"base_ms": 30, "per_input_token_us": 0.25}, {"base_ms": 30.0, "per_input_token_ms": 0.00025}),
+        ({"per_input_token_us": 2}, {"base_ms": 0.0, "per_input_token_ms": 0.002}),
+    ],
+)
+def test_prediction_compiler_carries_extra_cpu_overhead(extra, expected) -> None:
+    prediction = _tokenization_prediction(None)
+    if extra is not None:
+        prediction = CorePredictionConfig.model_validate(
+            {"engine": {**prediction.engine.model_dump(mode="json", exclude_none=True), "extra_cpu_overhead": extra}}
+        )
+
+    deployment = prediction_to_replay_spec(prediction).backend_deployment
+
+    assert deployment.extra_cpu_overhead == (pytest.approx(expected) if expected else None)
+    assert deployment.tokenization is None
+
+
+@pytest.mark.parametrize("mode", ["aggregated", "disaggregated"])
+@pytest.mark.parametrize("feature", ["frontend", "host_profile", "afd", "encoder"])
+@pytest.mark.parametrize(
+    ("extra", "rejected"),
+    [
+        (None, False),
+        ({}, False),
+        ({"base_ms": 0, "per_input_token_us": 0}, False),
+        ({"base_ms": 1}, True),
+        ({"per_input_token_us": 1}, True),
+    ],
+)
+def test_prediction_extra_cpu_overhead_exclusions_require_active_cost(mode, feature, extra, rejected) -> None:
+    host_role = "aggregated" if mode == "aggregated" else "prefill"
+    roles = ("aggregated",) if mode == "aggregated" else ("prefill", "decode")
+    workers = {role: {} for role in roles}
+    engine = {"model": "example/model", "hardware": "h200_sxm", "backend": "sglang", "mode": mode, "workers": workers}
+    raw = {"engine": engine}
+    if feature == "frontend":
+        workers[host_role]["frontend"] = {"stages": [{"service_ms": 3.0}]}
+    elif feature == "host_profile":
+        workers[host_role]["host_profile"] = {"path": "unused.json", "frontend": "python"}
+    elif feature == "afd":
+        engine["model"] = "Qwen/Qwen3-30B-A3B"
+        workers[host_role] = {"type": "afd", "afd": {"n_a_nodes": 1, "n_f_nodes": 1, "tp_a": 1, "a_batch_size": 8}}
+    else:
+        engine["model"] = "Qwen/Qwen3-VL-8B-Instruct"
+        workers["encoder"] = {}
+        raw["traffic"] = {
+            "source": {"type": "synthetic", "images": {"height": 448, "width": 448, "count": 1}},
+            "load": {"type": "concurrency", "concurrency": 1},
+            "stop": {"requests": 1},
+        }
+
+    baseline = CorePredictionConfig.model_validate(raw)
+    if extra is not None:
+        engine["extra_cpu_overhead"] = extra
+    if rejected:
+        with pytest.raises(ValidationError, match="engine.extra_cpu_overhead"):
+            CorePredictionConfig.model_validate(raw)
+    else:
+        prediction = CorePredictionConfig.model_validate(raw)
+        assert prediction.model_dump(exclude={"engine": {"extra_cpu_overhead"}}) == baseline.model_dump(
+            exclude={"engine": {"extra_cpu_overhead"}}
+        )
+        assert CorePredictionConfig.model_validate_json(prediction.model_dump_json()) == prediction
+
+
+@pytest.mark.parametrize(
     "tokenization",
     [
         {"workers": 0, "base_ms": 1},
@@ -3961,6 +4032,52 @@ def test_canonical_replay_spec_json_omits_unset_tokenization() -> None:
     tokenization = {"workers": 1, "base_ms": 1.0, "per_input_token_ms": 0.0}
     configured = json.loads(canonical_json(_spec(deployment=_tokenization_deployment(tokenization))))
     assert configured["backend_deployment"]["tokenization"] == tokenization
+
+
+def _extra_overhead_deployment(extra: dict, tokenization: dict | None = None) -> BackendDeploymentSpec:
+    return replace(_tokenization_deployment(tokenization or {}, 1), tokenization=tokenization, extra_cpu_overhead=extra)
+
+
+def test_engine_runner_sends_extra_cpu_overhead_in_the_execution_envelope() -> None:
+    runtime = RecordingRuntime()
+    extra = {"base_ms": 29.5, "per_input_token_ms": 0.000245}
+
+    EngineReplayRunnerFactory(runtime=runtime).create(0).run(_spec(deployment=_extra_overhead_deployment(extra)))
+
+    assert runtime.execution_spec["extra_cpu_overhead"] == extra
+    assert "tokenization" not in runtime.execution_spec
+
+
+def test_extra_cpu_overhead_requires_capability_and_offline_replay() -> None:
+    from aisim.sweeper import RunnerCapabilities
+
+    spec = _spec(deployment=_extra_overhead_deployment({"base_ms": 1.0, "per_input_token_ms": 0.0}))
+    with pytest.raises(ValueError, match="does not support engine.extra_cpu_overhead"):
+        RunnerCapabilities(supported_backend_topologies=(("*", "*"),)).require_compatible(spec)
+    engine = EngineReplayRunnerFactory(runtime=RecordingRuntime()).capabilities()
+    engine.require_compatible(spec)
+    with pytest.raises(ValueError, match="offline"):
+        replace(engine, supported_execution_modes=("offline", "online")).require_compatible(
+            replace(spec, execution_mode="online")
+        )
+
+
+def test_native_replay_delays_requests_by_the_extra_cpu_overhead_without_queueing() -> None:
+    report = (
+        EngineReplayRunnerFactory()
+        .create(0)
+        .run(
+            _spec(deployment=_extra_overhead_deployment({"base_ms": 3.0, "per_input_token_ms": 0.5})),
+            output_requirements=ReplayOutputRequirements(include_raw_report=True, capture_per_request=True),
+        )
+    )
+
+    (record,) = report.metadata["native_report"]["per_request"]
+    # 3 ms + 0.5 ms x 8 input tokens, counted from arrival.
+    assert record["arrival_time_ms"] == 0.0
+    assert record["tokenized_ms"] == 7.0
+    assert record["first_admit_ms"] == 7.0
+    assert record["ttft_ms"] > 7.0
 
 
 def _detokenization_prediction(detokenization: dict | None = None) -> CorePredictionConfig:

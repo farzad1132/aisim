@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Execute the complete patched Dynamo callback against the selected AIS core/SDK."""
+"""Execute the pinned Dynamo callback, unmodified, against the selected AIS core/SDK."""
 
 import argparse
 import hashlib
@@ -16,32 +16,32 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from build_simulation_dynamo import (
-    SPECULATION_DEPTH_NEW,
-    SPECULATION_DEPTH_OLD,
-    SPECULATION_DEPTH_PATH,
-    SPECULATION_DEPTH_SHA256,
-    locked_pyo3_version,
-)
+from build_simulation_dynamo import locked_pyo3_version
 
 from scripts.release.package_identity import core_package
 
+# Dynamo's callback at DYNAMO_REVISION, reviewed and compiled without changes.
+CALLBACK_PATH = "lib/bindings/python/rust/llm/ais_callback.rs"
+CALLBACK_SHA256 = "4e0f53f55f77ed5e5c5899702da0880846405c977110f3665aa2e5b64d641791"
+
 # Minimal interface scaffolding adapted from NVIDIA Dynamo, Apache-2.0:
-# https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/lib/mocker/src/common/perf_model.rs
-# https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/lib/kv-router/src/scheduling/prefill_load.rs
+# https://github.com/ai-dynamo/dynamo/blob/df666fbc6284e540ea0f5cac613da7f992b1fc7b/lib/mocker/src/common/perf_model.rs
+# https://github.com/ai-dynamo/dynamo/blob/df666fbc6284e540ea0f5cac613da7f992b1fc7b/lib/router/scheduler/src/prefill_load.rs
 # Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Modified: retain only the callback traits; no Dynamo scheduling implementation.
 SCAFFOLD = """// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 // Adapted interfaces from NVIDIA Dynamo, modified to omit scheduling implementation:
-// https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/lib/mocker/src/common/perf_model.rs
-// https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/lib/kv-router/src/scheduling/prefill_load.rs
+// https://github.com/ai-dynamo/dynamo/blob/df666fbc6284e540ea0f5cac613da7f992b1fc7b/lib/mocker/src/common/perf_model.rs
+// https://github.com/ai-dynamo/dynamo/blob/df666fbc6284e540ea0f5cac613da7f992b1fc7b/lib/router/scheduler/src/prefill_load.rs
 #![allow(dead_code)]
 extern crate self as dynamo_mocker;
-extern crate self as dynamo_kv_router;
-pub trait PrefillLoadEstimator: Send + Sync {
-    fn predict_prefill_duration(&self, batch_size: usize, effective_isl: usize,
-        prefix: usize) -> anyhow::Result<std::time::Duration>;
+extern crate self as dynamo_scheduler;
+pub mod host {
+    pub trait PrefillLoadEstimator: Send + Sync {
+        fn predict_prefill_duration(&self, batch_size: usize, effective_isl: usize,
+            prefix: usize) -> anyhow::Result<std::time::Duration>;
+    }
 }
 pub mod common { pub mod perf_model {
     pub trait AisCallback: Send + Sync {
@@ -57,19 +57,17 @@ mod callback;
 
 def check(source: Path, dynamo: Path) -> None:
     source, dynamo = source.resolve(), dynamo.resolve()
-    callback = dynamo / SPECULATION_DEPTH_PATH
-    patched = callback.read_bytes()
-    if patched.count(SPECULATION_DEPTH_NEW.encode()) != 1:
-        raise ValueError("callback must contain exactly the reviewed compatibility patch")
-    original = patched.replace(SPECULATION_DEPTH_NEW.encode(), SPECULATION_DEPTH_OLD.encode())
-    if hashlib.sha256(original).hexdigest() != SPECULATION_DEPTH_SHA256:
-        raise ValueError("callback does not match the complete pinned Dynamo source")
+    callback = dynamo / CALLBACK_PATH
+    callback_source = callback.read_bytes()
+    if hashlib.sha256(callback_source).hexdigest() != CALLBACK_SHA256:
+        raise ValueError("callback does not match the reviewed pinned Dynamo source")
     core = source / "crates/core"
     shape = re.search(
         r"pub (struct|enum) ForwardPassSpeculationConfig\b", (core / "src/perfmodel/fpm/config.rs").read_text()
     )
-    if shape is None:
-        raise ValueError("unrecognized speculation configuration API")
+    # The pinned callback reads `kind` and `params` from the generic configuration.
+    if shape is None or shape[1] != "struct":
+        raise ValueError("the pinned Dynamo callback needs the generic speculation configuration API")
     # Validate every Python source file, so a different checkout's installed SDK
     # cannot silently supply the Python half of the selected Rust core.
     python_paths = site.getsitepackages()
@@ -81,13 +79,12 @@ def check(source: Path, dynamo: Path) -> None:
                 raise ValueError(f"installed SDK differs from selected source: {path}")
         python_paths.append(str(installed.parent))
         print(f"SDK {package}: {installed}", flush=True)
-    print(f"Callback: {callback}; sha256={hashlib.sha256(patched).hexdigest()}", flush=True)
+    print(f"Callback: {callback}; sha256={hashlib.sha256(callback_source).hexdigest()}", flush=True)
     print(f"AIS core: {core}; speculation API={shape[1]}", flush=True)
     env = os.environ | {
         "PYO3_PYTHON": sys.executable,
         "PYTHONHOME": sys.base_prefix,
         "PYTHONPATH": os.pathsep.join(dict.fromkeys(python_paths)),
-        "AIS_CALLBACK_GENERIC_CONFIG": str(int(shape[1] == "struct")),
         "HF_HUB_OFFLINE": "1",
         "TRANSFORMERS_OFFLINE": "1",
     }
@@ -97,7 +94,7 @@ def check(source: Path, dynamo: Path) -> None:
             '[package]\nname = "dynamo-callback-contract"\nversion = "0.0.0"\nedition = "2024"\n'
             '[lib]\npath = "lib.rs"\n[features]\ndefault = ["ais-forward-pass"]\nais-forward-pass = []\n'
             "[dependencies]\n"
-            f"aisimulate-core = {{ package = {json.dumps(core_package(core))}, "
+            f"aisim-core = {{ package = {json.dumps(core_package(core))}, "
             f'path = {json.dumps(str(core))}, features = ["embed-python"] }}\n'
             f'pyo3 = {{ version = "={locked_pyo3_version(source / "Cargo.lock")}", '
             'features = ["auto-initialize", "abi3-py311"] }\n'
@@ -107,7 +104,8 @@ def check(source: Path, dynamo: Path) -> None:
         (root / "lib.rs").write_text(SCAFFOLD)
         contract = Path(__file__).resolve().with_name("dynamo_callback_contract.rs")
         (root / "callback.rs").write_bytes(
-            patched + f"\n#[cfg(test)]\nmod consumer_contract {{ include!({json.dumps(str(contract))}); }}\n".encode()
+            callback_source
+            + f"\n#[cfg(test)]\nmod consumer_contract {{ include!({json.dumps(str(contract))}); }}\n".encode()
         )
         manifest = ["--manifest-path", str(root / "Cargo.toml")]
         subprocess.run(

@@ -35,9 +35,9 @@ use crate::perf_database::PerfDatabase;
 use crate::perfmodel::afd::plan::AfdExecutionPlan;
 use crate::perfmodel::engine::spec::{EncoderImageShape, EngineSpec, VisionSpec};
 use crate::session::{
-    ContextOpFilter, OpListPlan, OpMemo, QueryMemo, context_op_runtime, generation_op_runtime,
-    get_mix_step_ops, query_context_op, query_generation_op, run_context_ops,
-    run_context_ops_planned, run_context_ops_with, run_generation_ops_step,
+    ContextOpFilter, OpList, OpListPlan, OpMemo, QueryMemo, context_op_runtime,
+    generation_op_runtime, get_mix_step_ops, query_context_op, query_generation_op,
+    run_context_ops, run_context_ops_planned, run_context_ops_with, run_generation_ops_step,
     run_generation_ops_step_beamed_with, run_generation_ops_step_planned,
 };
 use crate::{ForwardPassMetrics, ForwardPassWorkerType, validate_forward_pass_metrics};
@@ -239,7 +239,7 @@ impl PerOpFold {
 
     fn add(&mut self, op: &Op, r: PerformanceResult) {
         let position = self.entries.iter().position(|e| e.0 == op.name());
-        self.add_at(position, op, r);
+        self.add_at(position, op, &r);
     }
 
     /// [`Self::add`] for an op whose plan name slot is `slot`.
@@ -248,10 +248,10 @@ impl PerOpFold {
         if position.is_none() {
             self.slots[slot] = Some(self.entries.len());
         }
-        self.add_at(position, op, r);
+        self.add_at(position, op, &r);
     }
 
-    fn add_at(&mut self, position: Option<usize>, op: &Op, r: PerformanceResult) {
+    fn add_at(&mut self, position: Option<usize>, op: &Op, r: &PerformanceResult) {
         let name = op.name();
         let source = r.source.as_str();
         let mut fallbacks = None;
@@ -354,63 +354,132 @@ fn strip_per_op_metadata(entries: Vec<PerOpValueWithMetadata>) -> Vec<PerOpValue
         .collect()
 }
 
+/// SOL-view results of one rank walk by op list and query slot, each with the
+/// runtime context it was priced at. Ops of a slot price alike at an equal
+/// context ([`OpListPlan::query_slot`], [`ChildQuerySlots`]), so a result is
+/// lent to every such op of the walk. A failure is not kept.
+#[derive(Default)]
+struct SolQueryMemo {
+    results: [Vec<Vec<(RuntimeContext, PerformanceResult)>>; 2],
+}
+
+impl SolQueryMemo {
+    /// `query`'s result at `runtime` for an op of query `slot`; an op without
+    /// a slot is always queried.
+    fn query(
+        &mut self,
+        slot: Option<(OpList, usize)>,
+        runtime: &RuntimeContext,
+        query: impl FnOnce() -> Result<PerformanceResult, AicError>,
+    ) -> Result<Cow<'_, PerformanceResult>, AicError> {
+        let Some((list, slot)) = slot else {
+            return query().map(Cow::Owned);
+        };
+        let slots = &mut self.results[list as usize];
+        if slots.len() <= slot {
+            slots.resize_with(slot + 1, Vec::new);
+        }
+        let priced = &mut slots[slot];
+        let at = match priced.iter().position(|(at, _)| at == runtime) {
+            Some(at) => {
+                #[cfg(debug_assertions)]
+                {
+                    let repriced = query();
+                    assert!(
+                        repriced
+                            .as_ref()
+                            .is_ok_and(|repriced| repriced == &priced[at].1),
+                        "an op shares SOL query slot {slot} of {list:?} but prices as {repriced:?}, not {:?}",
+                        priced[at].1
+                    );
+                }
+                at
+            }
+            None => {
+                priced.push((*runtime, query()?));
+                priced.len() - 1
+            }
+        };
+        Ok(Cow::Borrowed(&priced[at].1))
+    }
+}
+
 /// Name-folded operation evidence of one operation-graph forward-pass rank:
 /// executed values, sources and fallbacks folded like [`PerOpFold`], plus the
 /// SOL comparison [`Engine::static_phase_diagnostics`] reports, priced at each
 /// operation's own runtime context. A name's SOL stops at its first failure.
 struct RankOperationFold {
     fold: PerOpFold,
-    positions: HashMap<String, usize>,
     sols: Vec<Option<Result<super::diagnostics::SolDiagnostics, AicError>>>,
     sol_db: PerfDatabase,
+    sol_queries: SolQueryMemo,
 }
 
 impl RankOperationFold {
     fn new(db: &PerfDatabase) -> Self {
         Self {
             fold: PerOpFold::new("context"),
-            positions: HashMap::new(),
             sols: Vec::new(),
             sol_db: db.sol_full_view(),
+            sol_queries: SolQueryMemo::default(),
         }
     }
 
-    /// Fold `op`'s `result` executed in `inference_phase`, divided by the
-    /// `divisor` its composition applies. `sol` prices the same query in the
-    /// SOL view.
+    /// Start a walk over `names`' slots, or by name without them.
+    fn begin(&mut self, names: Option<&Arc<[String]>>) {
+        self.fold.slots = vec![None; names.map_or(0, |names| names.len())];
+    }
+
+    /// Fold `op`'s `result` executed in `inference_phase` at the `runtime`
+    /// context, divided by the `divisor` its composition applies. `slot` is
+    /// its name slot in the walk's names. The SOL view prices the same query,
+    /// once per `query_slot` and runtime context.
+    #[allow(clippy::too_many_arguments)]
     fn add(
         &mut self,
         inference_phase: &'static str,
+        slot: Option<usize>,
+        query_slot: Option<(OpList, usize)>,
         op: &Op,
-        mut result: PerformanceResult,
+        mut result: Cow<'_, PerformanceResult>,
         divisor: f64,
-        sol: impl FnOnce(&PerfDatabase) -> Result<PerformanceResult, AicError>,
+        runtime: impl FnOnce() -> RuntimeContext,
     ) {
         if divisor != 1.0 {
+            let result = result.to_mut();
             result.latency_ms /= divisor;
             result.energy_wms /= divisor;
         }
-        let position = self.positions.get(op.name()).copied();
-        let slot = position.unwrap_or(self.sols.len());
+        let position = match slot {
+            Some(slot) => self.fold.slots[slot],
+            None => self.fold.entries.iter().position(|e| e.0 == op.name()),
+        };
+        let entry = position.unwrap_or(self.sols.len());
         if position.is_none() {
-            self.positions.insert(op.name().to_owned(), slot);
+            if let Some(slot) = slot {
+                self.fold.slots[slot] = Some(entry);
+            }
             self.sols.push(None);
         }
         self.fold.inference_phase = inference_phase;
-        self.fold.add_at(position, op, result);
-        let entry = &mut self.sols[slot];
-        if matches!(entry, Some(Err(_))) {
+        self.fold.add_at(position, op, &result);
+        let sol = &mut self.sols[entry];
+        if matches!(sol, Some(Err(_))) {
             return;
         }
-        let next = sol(&self.sol_db).and_then(|result| {
-            let (math_ms, memory_ms) = sol_components(op, &result)?;
-            Ok(super::diagnostics::SolDiagnostics {
-                latency_ms: result.latency_ms / divisor,
-                math_ms: math_ms / divisor,
-                memory_ms: memory_ms / divisor,
-            })
-        });
-        *entry = Some(match (entry.take(), next) {
+        let runtime = runtime();
+        let next = self
+            .sol_queries
+            .query(query_slot, &runtime, || op.query(&self.sol_db, &runtime))
+            .and_then(|result| {
+                let (math_ms, memory_ms) = sol_components(op, &result)?;
+                Ok(super::diagnostics::SolDiagnostics {
+                    latency_ms: result.latency_ms / divisor,
+                    math_ms: math_ms / divisor,
+                    memory_ms: memory_ms / divisor,
+                })
+            });
+        *sol = Some(match (sol.take(), next) {
             (Some(Ok(sum)), Ok(next)) => Ok(sum.plus(&next)),
             (_, next) => next,
         });
@@ -857,38 +926,24 @@ enum OperationObserver {
 impl OperationObserver {
     /// Start a walk whose operations have `names`' slots, or no slots.
     fn begin(&mut self, names: Option<&Arc<[String]>>) {
-        if let Self::Values(fold) = self {
-            fold.begin(names);
-        }
-    }
-
-    /// Observe `op`'s raw `result` executed in `inference_phase` at the
-    /// `runtime` context, divided by the `divisor` its composition applies.
-    /// `slot` is its name slot in the walk's names.
-    fn add(
-        &mut self,
-        inference_phase: &'static str,
-        slot: Option<usize>,
-        op: &Op,
-        result: PerformanceResult,
-        divisor: f64,
-        runtime: impl FnOnce() -> RuntimeContext,
-    ) {
         match self {
             Self::Latency => {}
-            Self::Diagnostics(fold) => fold.add(inference_phase, op, result, divisor, |db| {
-                op.query(db, &runtime())
-            }),
-            Self::Values(fold) => fold.add(slot, op, result, divisor),
+            Self::Diagnostics(fold) => fold.begin(names),
+            Self::Values(fold) => fold.begin(names),
         }
     }
 
-    /// [`Self::add`] of a result its pass's [`QueryMemo`] may have lent. An
-    /// undivided slot fold reads it in place; anything else takes it.
-    fn add_lent(
+    /// Observe `op`'s raw `result`, which its pass may have lent, executed in
+    /// inference `phase` at the `runtime` context and divided by the
+    /// `divisor` its composition applies. `slot` is its name slot in the
+    /// walk's names and `query_slot` the one it shares SOL results by. An
+    /// undivided slot fold reads the result in place.
+    #[allow(clippy::too_many_arguments)]
+    fn add(
         &mut self,
-        inference_phase: &'static str,
+        phase: &'static str,
         slot: Option<usize>,
+        query_slot: Option<(OpList, usize)>,
         op: &Op,
         result: Cow<'_, PerformanceResult>,
         divisor: f64,
@@ -896,6 +951,9 @@ impl OperationObserver {
     ) {
         match (&mut *self, slot) {
             (Self::Latency, _) => {}
+            (Self::Diagnostics(fold), _) => {
+                fold.add(phase, slot, query_slot, op, result, divisor, runtime)
+            }
             (
                 Self::Values(RankValueFold {
                     slots: Some(slots), ..
@@ -905,14 +963,7 @@ impl OperationObserver {
                 slot,
                 (result.latency_ms, result.energy_wms, result.source.as_str()),
             ),
-            _ => self.add(
-                inference_phase,
-                slot,
-                op,
-                result.into_owned(),
-                divisor,
-                runtime,
-            ),
+            (Self::Values(fold), _) => fold.add(slot, op, result.into_owned(), divisor),
         }
     }
 }
@@ -2691,6 +2742,19 @@ impl Engine {
             .get_or_init(|| OpMemo::new(OP_MEMO_CAPACITY, &self.context_ops, &self.generation_ops))
     }
 
+    /// Query slots of the children each DSv4.1 staged walk pass runs:
+    /// decode-only, prefill, decode attention after a prefill.
+    fn stage_queries(&self) -> &[ChildQuerySlots; 3] {
+        self.stage_queries.get_or_init(|| {
+            let generation = || stage_children(&self.generation_ops);
+            [
+                ChildQuerySlots::new(generation()),
+                ChildQuerySlots::new(stage_children(&self.context_ops)),
+                ChildQuerySlots::new(generation().filter(|op| op.is_generation_attention())),
+            ]
+        })
+    }
+
     /// Scope every prefill extend before fusing token-major work with decode.
     /// Applying a decoder tail to the combined batch would incorrectly discard
     /// decode tokens and other requests' tails. The tuple is (batch, new, prefix).
@@ -2709,16 +2773,7 @@ impl Engine {
         generation_scale: f64,
         mut on_op: impl FnMut(MixedPass, usize, &Op, &RuntimeContext, &PerformanceResult),
     ) -> Result<[f64; 4], AicError> {
-        // Query slots of each pass's children: decode-only, prefill, decode
-        // attention after a prefill.
-        let [generation, context, decode_attention] = self.stage_queries.get_or_init(|| {
-            let generation = || stage_children(&self.generation_ops);
-            [
-                ChildQuerySlots::new(generation()),
-                ChildQuerySlots::new(stage_children(&self.context_ops)),
-                ChildQuerySlots::new(generation().filter(|op| op.is_generation_attention())),
-            ]
-        });
+        let [generation, context, decode_attention] = self.stage_queries();
         // Each generation and context child's role, so that a walk reads no name.
         let [generation_role, context_role] = self.stage_roles.get_or_init(|| {
             [
@@ -4153,6 +4208,7 @@ impl Engine {
             }
             // Stage children fold by the slots of the walk their passes run.
             let plan = self.stage_plan.as_ref();
+            let [generation, context, decode_attention] = self.stage_queries();
             operations
                 .begin(plan.map(|plan| plan.names(has_prefill, sched.num_decode_requests > 0)));
             return self
@@ -4170,8 +4226,17 @@ impl Engine {
                             "generation"
                         };
                         let slot = plan.and_then(|plan| plan.slot(has_prefill, pass, child));
+                        // A walk runs the decode-only pass or the other two,
+                        // so the generation slots of one walk are one pass's.
+                        let query_slot = Some(match (has_prefill, pass) {
+                            (false, _) => (OpList::Generation, generation.of_child[child]),
+                            (true, MixedPass::DecodeAttention) => {
+                                (OpList::Generation, decode_attention.of_child[child])
+                            }
+                            (true, _) => (OpList::Context, context.of_child[child]),
+                        });
                         let result = Cow::Borrowed(result);
-                        operations.add_lent(phase, slot, op, result, 1.0, || *runtime);
+                        operations.add(phase, slot, query_slot, op, result, 1.0, || *runtime);
                     },
                 )
                 .map(|parts| parts[0]);
@@ -4208,12 +4273,16 @@ impl Engine {
                 kv_per_req,
                 n_decode,
                 |context, index, op, runtime, result, divisor| {
-                    let (phase, slot) = if context {
-                        ("context", Some(plan.context_slot[index]))
+                    let (phase, slot, query_slot) = if context {
+                        let query_slot = self.context_plan.query_slot(index);
+                        let query_slot = query_slot.map(|slot| (OpList::Context, slot));
+                        ("context", Some(plan.context_slot[index]), query_slot)
                     } else {
-                        ("generation", plan.generation_slot[index])
+                        let query_slot = self.generation_plan.query_slot(index);
+                        let query_slot = query_slot.map(|slot| (OpList::Generation, slot));
+                        ("generation", plan.generation_slot[index], query_slot)
                     };
-                    operations.add_lent(phase, slot, op, result, divisor, || *runtime);
+                    operations.add(phase, slot, query_slot, op, result, divisor, || *runtime);
                 },
             );
         }
@@ -4250,7 +4319,9 @@ impl Engine {
                         ContextOpFilter::All,
                         |index, op, result| {
                             let slot = Some(self.context_plan.name_slot(index));
-                            operations.add_lent("context", slot, op, result, 1.0, || {
+                            let query_slot = self.context_plan.query_slot(index);
+                            let query_slot = query_slot.map(|slot| (OpList::Context, slot));
+                            operations.add("context", slot, query_slot, op, result, 1.0, || {
                                 context_op_runtime(
                                     op,
                                     n_prefill,
@@ -4283,7 +4354,9 @@ impl Engine {
                 false,
                 |index, op, result| {
                     let slot = Some(self.generation_plan.name_slot(index));
-                    operations.add_lent("generation", slot, op, result, 1.0, || runtime);
+                    let query_slot = self.generation_plan.query_slot(index);
+                    let query_slot = query_slot.map(|slot| (OpList::Generation, slot));
+                    operations.add("generation", slot, query_slot, op, result, 1.0, || runtime);
                 },
             )?;
         }
@@ -5250,6 +5323,33 @@ pub(crate) mod tests {
             assert!(matches!(memo.query(index, price), Ok(Cow::Borrowed(_))));
         }
         assert!(matches!(memo.query(5, price), Ok(Cow::Owned(_))));
+    }
+
+    /// A SOL query slot lends its result at the runtime context it was priced
+    /// at, prices anew at another and keeps no failure; an op without a slot
+    /// owns its own.
+    #[test]
+    fn a_sol_query_slot_lends_its_result_at_an_equal_runtime() {
+        use crate::operators::base::Source;
+        let mut memo = SolQueryMemo::default();
+        let price = |ms| move || Ok(PerformanceResult::new(ms, Source::Silicon));
+        let runtime = |batch| generation_op_runtime(batch, 1, 1025, 1.0, 0, None);
+        let slot = Some((OpList::Generation, 2));
+        let failed = memo.query(slot, &runtime(8), || {
+            Err(AicError::InvalidEngineConfig("no data".into()))
+        });
+        assert!(failed.is_err());
+        for (batch, ms, priced) in [(8, 1.0, 1), (8, 1.0, 1), (4, 2.0, 2), (8, 1.0, 2)] {
+            let result = memo.query(slot, &runtime(batch), price(ms)).unwrap();
+            assert_eq!(result.latency_ms, ms);
+            assert_eq!(memo.results[OpList::Generation as usize][2].len(), priced);
+        }
+        // The same slot number of the other op list is another slot.
+        let context = Some((OpList::Context, 2));
+        let result = memo.query(context, &runtime(8), price(3.0)).unwrap();
+        assert_eq!(result.latency_ms, 3.0);
+        let unshared = memo.query(None, &runtime(8), price(4.0));
+        assert!(matches!(unshared, Ok(Cow::Owned(_))));
     }
 
     #[test]

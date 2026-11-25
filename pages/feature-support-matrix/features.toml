@@ -122,7 +122,7 @@ name = "Engine-loop launch cost"
 doc = "replay/engine/workers.md#vllm-pass-launch"
 # SGLang's host loop leaves the scheduler thread's batch-level CPU work uncharged.
 cells = ["limited", "not_supported", "not_supported"]
-note = "User-measured launch costs set when vLLM returns a pass's outputs; one-GPU aggregated workers with async scheduling, offline replay only."
+note = "User-measured launch costs set when vLLM returns a pass's outputs and, with an offloading_v0_32 or simple_cpu_v0_32 CPU tier, when Model Runner V2 sees a CPU-tier load finish. Requires one-GPU aggregated workers with async scheduling in offline replay. With MTP and G2, this requires a recurrent state cache and disable_eagle_block_drop=true."
 
 [[sections.rows]]
 name = "Serial batch-selection cost"

@@ -271,7 +271,7 @@ jobs:
         # The crate's own oracle/unit tests were previously NOT in any gate,
         # which let "match Python" pins go stale silently (e.g. the b200
         # mem_bw test survived a YAML correction unnoticed). The py:: binding
-        # tests self-initialize the interpreter (prepare_freethreaded_python),
+        # tests self-initialize the interpreter (Python::initialize),
         # so plain `cargo test --lib` covers them; PYO3_PYTHON pins the venv
         # interpreter for linking.
         env:

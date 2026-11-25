@@ -249,6 +249,8 @@ jobs:
             -r "${RUNNER_TEMP}/wheel/requirements.txt"
           "${RUNNER_TEMP}/callback-venv/bin/python" -m pip install --no-deps \
             "$(python scripts/release/package_identity.py "${RUNNER_TEMP}/wheel")"
+          # The callback check runs with the Hub offline; fetch this revision's pinned data first.
+          "${RUNNER_TEMP}/callback-venv/bin/python" scripts/performance/prefetch_op_latency.py
           "${RUNNER_TEMP}/callback-venv/bin/python" \
             scripts/performance/check_dynamo_callback.py source dynamo
           cp scripts/performance/simulation_dynamo_requirements.txt "${RUNNER_TEMP}/wheel/dynamo-requirements.txt"
@@ -374,6 +376,8 @@ jobs:
             "${venv}/bin/python" -m pip install --require-hashes -r "${dist}/requirements.txt"
             "${venv}/bin/python" -m pip install --require-hashes -r "${dist}/dynamo-requirements.txt"
             "${venv}/bin/python" -m pip install --no-deps "${dist}"/*.whl
+            # Benchmark workers run with the Hub offline; fetch this revision's pinned data first.
+            "${venv}/bin/python" scripts/performance/prefetch_op_latency.py
             cp "${dist}/requirements.txt" "${RESULTS_DIR}/provenance/${side}-requirements.txt"
             cp "${dist}/dynamo-requirements.txt" "${RESULTS_DIR}/provenance/${side}-dynamo-requirements.txt"
             cp "${dist}/dynamo-build.patch" "${RESULTS_DIR}/provenance/${side}-dynamo-build.patch"

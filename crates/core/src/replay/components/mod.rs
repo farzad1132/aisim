@@ -17,7 +17,7 @@ pub(crate) use detokenization::{DetokenizationStage, PassReceipt};
 pub(crate) use encoder::EncoderPool;
 pub(crate) use engine::EngineComponent;
 pub use tokenization::TokenizationLatency;
-pub(crate) use tokenization::TokenizationStage;
+pub(crate) use tokenization::{ExtraCpuOverhead, TokenizationStage};
 pub use types::ReplayEngineObservation;
 pub(crate) use types::ReplayMode;
 pub use types::TrafficStats;

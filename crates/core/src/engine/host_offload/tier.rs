@@ -192,9 +192,10 @@ pub(crate) enum LoadOutcome {
 }
 
 /// Successful transfer completion returned to the framework adapter.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum CompletedTransfer {
     Store {
+        at_ms: f64,
         request_id: Uuid,
         transfer_id: TransferId,
         blocks: Vec<HostBlockKey>,
@@ -297,6 +298,9 @@ struct Transfer {
     weight: usize,
     /// Fixed completion time of a submitted private-lane transfer.
     deadline: Option<f64>,
+    /// A load whose `LoadQueued` observation waits for
+    /// [`HostTier::retime_load`]: when it was queued.
+    queued_at_ms: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -384,9 +388,14 @@ struct Client {
     pending_transfers: usize,
     /// Physically complete transfers the owner has not consumed yet.
     done: VecDeque<(f64, CompletedTransfer)>,
+    /// End of the last physical copy, retained after delivery.
+    last_completed_ms: Option<f64>,
     seen_epoch: u64,
     /// A completed store stays pinned until its owner hands it to G3.
     holds_completed_sources: bool,
+    /// The owner retimes each load once it knows the engine's copy timing;
+    /// the load's `LoadQueued` observation waits for that.
+    retimes_loads: bool,
     /// Pending `HostPinned` residency events of a subscribed rank.
     events: Option<Vec<KvEventData>>,
 }
@@ -509,8 +518,10 @@ impl HostTier {
                 prepared_stores: VecDeque::new(),
                 pending_transfers: 0,
                 done: VecDeque::new(),
+                last_completed_ms: None,
                 seen_epoch: self.completion_epoch,
                 holds_completed_sources: false,
+                retimes_loads: false,
                 events: None,
             },
         );
@@ -520,6 +531,73 @@ impl HostTier {
     /// Keep completed D2H sources pinned until [`Self::unpin_external`].
     pub(crate) fn hold_completed_sources(&mut self, client: u64) {
         self.client(client).holds_completed_sources = true;
+    }
+
+    /// `client` calls [`Self::retime_load`] for each of its private-lane
+    /// loads; their `LoadQueued` observations wait for it.
+    pub(crate) fn retime_loads(&mut self, client: u64) {
+        self.client(client).retimes_loads = true;
+    }
+
+    /// Set a queued private-lane load's completion to the connector's resolved
+    /// `completes_at_ms`, never before the pool's current time, and report its
+    /// queueing if that was waiting for this call. The owner resolves copy
+    /// ordering and destination fences; this replaces the provisional lane
+    /// deadline, either earlier or later. Returns the completion.
+    pub(crate) fn retime_load(&mut self, transfer_id: TransferId, completes_at_ms: f64) -> f64 {
+        assert_valid_time("host load completion", completes_at_ms);
+        let transfer = &self.transfers[&transfer_id];
+        assert_eq!(transfer.kind, Kind::Load, "only a load is retimed");
+        let lane_ms = transfer
+            .deadline
+            .expect("a retimed load is queued on a private lane");
+        let at_ms = completes_at_ms.max(self.current_time_ms);
+        if at_ms != lane_ms {
+            let Transport::Fifo { deadlines, .. } = &mut self.transport else {
+                unreachable!("a deadline belongs to a private lane")
+            };
+            let deadline = |at_ms| Deadline {
+                at_ms,
+                kind: Kind::Load,
+                transfer_id,
+            };
+            assert!(deadlines.remove(&deadline(lane_ms)));
+            assert!(deadlines.insert(deadline(at_ms)));
+            self.transfers.get_mut(&transfer_id).unwrap().deadline = Some(at_ms);
+        }
+        if let Some(queued_at_ms) = self
+            .transfers
+            .get_mut(&transfer_id)
+            .unwrap()
+            .queued_at_ms
+            .take()
+        {
+            self.observe_load_queued(
+                &self.transfers[&transfer_id],
+                transfer_id,
+                queued_at_ms,
+                at_ms,
+            );
+        }
+        at_ms
+    }
+
+    fn observe_load_queued(
+        &self,
+        transfer: &Transfer,
+        transfer_id: TransferId,
+        at_ms: f64,
+        completes_at_ms: f64,
+    ) {
+        self.observe(HostOffloadObservation {
+            request_id: transfer.request_id,
+            event: HostOffloadObservationData::LoadQueued {
+                at_ms,
+                completes_at_ms,
+                transfer_id,
+                blocks: &transfer.blocks,
+            },
+        });
     }
 
     /// Deliver `HostPinned` residency changes of this pool to `client`,
@@ -792,6 +870,7 @@ impl HostTier {
                 blocks: missing,
                 weight,
                 deadline: None,
+                queued_at_ms: None,
             },
         );
         transfer_id
@@ -1549,6 +1628,7 @@ impl HostTier {
         }
 
         let transfer_id = self.allocate_transfer_id();
+        let retimed = self.clients[&client].retimes_loads;
         self.insert_transfer(
             transfer_id,
             Transfer {
@@ -1558,9 +1638,12 @@ impl HostTier {
                 blocks: blocks.to_vec(),
                 weight,
                 deadline: None,
+                queued_at_ms: retimed.then_some(now_ms),
             },
         );
-        if let Some(completes_at_ms) = self.submit(transfer_id, now_ms, now_ms.max(not_before_ms)) {
+        if let Some(completes_at_ms) = self.submit(transfer_id, now_ms, now_ms.max(not_before_ms))
+            && !retimed
+        {
             self.observe(HostOffloadObservation {
                 request_id,
                 event: HostOffloadObservationData::LoadQueued {
@@ -1612,6 +1695,9 @@ impl HostTier {
         self.remove_queued(transfer_id);
         let transfer = self.remove_transfer(transfer_id).unwrap();
         self.release_load_pins(&transfer.blocks);
+        if let (Some(at_ms), Some(completes_at_ms)) = (transfer.queued_at_ms, transfer.deadline) {
+            self.observe_load_queued(&transfer, transfer_id, at_ms, completes_at_ms);
+        }
         self.observe(HostOffloadObservation {
             request_id: transfer.request_id,
             event: HostOffloadObservationData::LoadCancelled {
@@ -1680,6 +1766,12 @@ impl HostTier {
     }
 
     fn finish(&mut self, transfer_id: TransferId, at_ms: f64) {
+        let transfer = self
+            .remove_transfer(transfer_id)
+            .expect("due host transfer disappeared");
+        if let Some(queued_at_ms) = transfer.queued_at_ms {
+            self.observe_load_queued(&transfer, transfer_id, queued_at_ms, at_ms);
+        }
         let Transfer {
             kind,
             client,
@@ -1687,9 +1779,8 @@ impl HostTier {
             blocks,
             weight,
             deadline,
-        } = self
-            .remove_transfer(transfer_id)
-            .expect("due host transfer disappeared");
+            queued_at_ms: _,
+        } = transfer;
         assert!(deadline.is_none_or(|deadline| deadline == at_ms));
         self.completion_epoch += 1;
         let completed = if kind == Kind::Store {
@@ -1721,6 +1812,7 @@ impl HostTier {
                 },
             });
             CompletedTransfer::Store {
+                at_ms,
                 request_id,
                 transfer_id,
                 blocks,
@@ -1742,6 +1834,7 @@ impl HostTier {
             }
         };
         if let Some(state) = self.clients.get_mut(&client) {
+            state.last_completed_ms = Some(at_ms);
             state.done.push_back((at_ms, completed));
         }
     }
@@ -1788,6 +1881,26 @@ impl HostTier {
         self.transfers.get(&transfer_id)?.deadline
     }
 
+    /// A private-lane load's service: the link's first-byte latency, which
+    /// does not hold the lane, then how long its bytes hold the lane. `None`
+    /// for a shared pool.
+    pub(crate) fn load_service_ms(&self, transfer_id: TransferId) -> Option<(f64, f64)> {
+        let transfer = self.transfers.get(&transfer_id)?;
+        let Transport::Fifo { h2d, .. } = &self.transport else {
+            return None;
+        };
+        let bytes = self.transfer_bytes(transfer.weight);
+        let copy_ms = if h2d.bytes_per_ms.is_infinite() {
+            0.0
+        } else {
+            bytes as f64 / h2d.bytes_per_ms
+        };
+        Some((
+            self.clients[&transfer.client].link.latency_to_first_byte_ms,
+            copy_ms,
+        ))
+    }
+
     /// When the last submitted private-lane transfer of `client` completes.
     pub(crate) fn last_deadline(&self, client: u64) -> Option<f64> {
         self.transfers
@@ -1795,6 +1908,13 @@ impl HostTier {
             .filter(|transfer| transfer.client == client)
             .filter_map(|transfer| transfer.deadline)
             .max_by(f64::total_cmp)
+    }
+
+    /// Latest end of this client's submitted copies on a private lane.
+    /// Pending deadlines lie at or after every physical completion.
+    pub(crate) fn last_transfer_end_ms(&self, client: u64) -> Option<f64> {
+        self.last_deadline(client)
+            .or(self.clients[&client].last_completed_ms)
     }
 
     pub(crate) fn has_transfer(&self, transfer_id: TransferId) -> bool {
@@ -2871,6 +2991,207 @@ pub(crate) mod tests {
         assert_eq!(tier.transfer_deadline(second_store), Some(now + 2.0));
         assert_eq!(tier.transfer_deadline(first_load), Some(now + 1.0));
         assert_eq!(tier.transfer_deadline(second_load), Some(now + 2.0));
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum ObservedLoadEvent {
+        Queued { at_ms: f64, completes_at_ms: f64 },
+        Completed { at_ms: f64 },
+        Cancelled { at_ms: f64 },
+    }
+
+    #[derive(Default)]
+    struct LoadObserver(Mutex<Vec<ObservedLoadEvent>>);
+
+    impl HostOffloadObserver for LoadObserver {
+        fn record(&self, observation: HostOffloadObservation<'_>) {
+            let event = match observation.event {
+                HostOffloadObservationData::LoadQueued {
+                    at_ms,
+                    completes_at_ms,
+                    ..
+                } => ObservedLoadEvent::Queued {
+                    at_ms,
+                    completes_at_ms,
+                },
+                HostOffloadObservationData::LoadCompleted { at_ms, .. } => {
+                    ObservedLoadEvent::Completed { at_ms }
+                }
+                HostOffloadObservationData::LoadCancelled { at_ms, .. } => {
+                    ObservedLoadEvent::Cancelled { at_ms }
+                }
+                _ => return,
+            };
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    /// One MB at 0.1 GB/s: queued at 10 ms, due at 20 ms, not yet observed.
+    fn deferred_load() -> (HostTier, TransferId, Arc<LoadObserver>) {
+        let mut tier = per_rank(1, 0.0, 0.1);
+        make_resident(&mut tier, &[key(1)], 0.0);
+        let observer = Arc::new(LoadObserver::default());
+        tier.set_observer(observer.clone());
+        tier.retime_loads(C);
+        let LoadOutcome::Queued(load) = tier.schedule_load(C, request_id(), &[key(1)], 10.0, 10.0)
+        else {
+            panic!("resident block should load")
+        };
+        assert_eq!(tier.transfer_deadline(load), Some(20.0));
+        assert!(observer.0.lock().unwrap().is_empty());
+        (tier, load, observer)
+    }
+
+    #[test]
+    fn deferred_load_retime_floors_deadlines_and_observes_queue_once() {
+        for (requested, expected) in [
+            (0.0, 12.0),
+            (12.0, 12.0),
+            (15.0, 15.0),
+            (20.0, 20.0),
+            (30.0, 30.0),
+        ] {
+            let (mut tier, load, observer) = deferred_load();
+            assert!(tier.tick(C, 12.0).0.is_empty());
+            assert!(observer.0.lock().unwrap().is_empty());
+            // Both the per-transfer deadline and the ordered deadline set
+            // must move, with no stale entry at the original lane deadline.
+            assert_eq!(tier.retime_load(load, requested), expected);
+            assert_eq!(tier.transfer_deadline(load), Some(expected));
+            assert_eq!(tier.next_deadline(C), Some(expected));
+            assert_eq!(tier.deadline_count(), 1);
+            assert_eq!(
+                *observer.0.lock().unwrap(),
+                [ObservedLoadEvent::Queued {
+                    at_ms: 10.0,
+                    completes_at_ms: expected,
+                }]
+            );
+            assert_eq!(tier.retime_load(load, requested), expected);
+            if expected > 12.0 {
+                assert!(tier.tick(C, expected - 0.5).0.is_empty());
+                assert_eq!(tier.pins(key(1)), 1);
+            }
+            assert_eq!(
+                tier.tick(C, expected).0,
+                [CompletedTransfer::Load {
+                    request_id: request_id(),
+                    transfer_id: load,
+                    blocks: vec![key(1)],
+                }]
+            );
+            assert_eq!(tier.last_transfer_end_ms(C), Some(expected));
+            assert_eq!(tier.deadline_count(), 0);
+            assert_eq!(tier.next_deadline(C), None);
+            assert_eq!(tier.pins(key(1)), 0);
+            assert!(tier.tick(C, 30.0).0.is_empty());
+            assert_eq!(
+                *observer.0.lock().unwrap(),
+                [
+                    ObservedLoadEvent::Queued {
+                        at_ms: 10.0,
+                        completes_at_ms: expected,
+                    },
+                    ObservedLoadEvent::Completed { at_ms: expected },
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_load_queue_is_observed_once_before_cancellation() {
+        // Cancel both before the owner retimes the load and after retiming
+        // shortens or extends the deadline.
+        for (requested, expected) in [(None, 20.0), (Some(15.0), 15.0), (Some(30.0), 30.0)] {
+            let (mut tier, load, observer) = deferred_load();
+            if let Some(requested) = requested {
+                assert_eq!(tier.retime_load(load, requested), expected);
+            }
+            assert!(tier.cancel_load(C, load, 12.0, 13.0));
+            assert!(!tier.cancel_load(C, load, 12.0, 13.0));
+            assert_eq!(tier.transfer_deadline(load), None);
+            // Only the seed store completed. The cancelled load has no end
+            // for a subsequent synchronization to wait for.
+            assert_eq!(tier.last_transfer_end_ms(C), Some(0.0));
+            assert_eq!(tier.deadline_count(), 0);
+            assert_eq!(tier.next_deadline(C), None);
+            assert_eq!(tier.pins(key(1)), 0);
+            assert!(tier.tick(C, 30.0).0.is_empty());
+            assert_eq!(
+                *observer.0.lock().unwrap(),
+                [
+                    ObservedLoadEvent::Queued {
+                        at_ms: 10.0,
+                        completes_at_ms: expected,
+                    },
+                    ObservedLoadEvent::Cancelled { at_ms: 13.0 },
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn a_retimed_load_keeps_sources_pinned_under_store_pressure_until_its_copy_ends() {
+        let (mut tier, load, observer) = deferred_load();
+        tier.retime_load(load, 30.0);
+        // The provisional lane ended at 20, but the connector is still
+        // reading until 30. A competing store cannot reclaim its source.
+        for now in [20.0, 29.5] {
+            assert_eq!(
+                tier.prepare_store(C, Uuid::from_u128(2), &[key(2)], None, now),
+                StoreOutcome::RetryCapacity {
+                    structurally_unfittable: false,
+                }
+            );
+            assert_eq!(tier.lookup(key(1)), Lookup::Hit);
+            assert_eq!(tier.pins(key(1)), 1);
+        }
+        assert_eq!(tier.tick(C, 30.0).0.len(), 1);
+        assert_eq!(tier.pins(key(1)), 0);
+        assert!(matches!(
+            tier.prepare_store(C, Uuid::from_u128(2), &[key(2)], None, 30.0),
+            StoreOutcome::Prepared { .. }
+        ));
+        assert_eq!(tier.lookup(key(1)), Lookup::Miss);
+        assert_eq!(
+            *observer.0.lock().unwrap(),
+            [
+                ObservedLoadEvent::Queued {
+                    at_ms: 10.0,
+                    completes_at_ms: 30.0,
+                },
+                ObservedLoadEvent::Completed { at_ms: 30.0 },
+            ]
+        );
+    }
+
+    #[test]
+    fn deferred_load_queue_is_observed_once_before_completion_without_retime() {
+        let (mut tier, load, observer) = deferred_load();
+        assert!(tier.tick(C, 19.0).0.is_empty());
+        assert!(observer.0.lock().unwrap().is_empty());
+        assert_eq!(
+            tier.tick(C, 25.0).0,
+            [CompletedTransfer::Load {
+                request_id: request_id(),
+                transfer_id: load,
+                blocks: vec![key(1)],
+            }]
+        );
+        assert_eq!(tier.next_deadline(C), None);
+        assert_eq!(tier.pins(key(1)), 0);
+        assert!(tier.tick(C, 30.0).0.is_empty());
+        assert!(!tier.cancel_load(C, load, 30.0, 30.0));
+        assert_eq!(
+            *observer.0.lock().unwrap(),
+            [
+                ObservedLoadEvent::Queued {
+                    at_ms: 10.0,
+                    completes_at_ms: 20.0,
+                },
+                ObservedLoadEvent::Completed { at_ms: 20.0 },
+            ]
+        );
     }
 
     #[test]

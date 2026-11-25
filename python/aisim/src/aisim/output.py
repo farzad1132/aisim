@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 
 _RECOMMENDATION_NAME = re.compile(r"^[0-9]{4}\.yaml$")
 _COMPACT_JSON = json.JSONEncoder(sort_keys=True, separators=(",", ":"))
+_STRICT_COMPACT_JSON = json.JSONEncoder(sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
 # Files a finished run leaves behind. Their presence means the directory holds
@@ -476,7 +477,8 @@ def write_telemetry(root: Path, telemetry: dict[str, Any], *, exclusive: bool = 
             with _open_result(path, exclusive=exclusive) as output:
                 created.append((path, _file_identity(output)))
                 for record in telemetry[stream]:
-                    json.dump(record, output, sort_keys=True, separators=(",", ":"), allow_nan=False)
+                    # One C-encoder call per row; json.dump walks the row in Python, one write per token.
+                    output.write(_STRICT_COMPACT_JSON.encode(record))
                     output.write("\n")
     except BaseException:
         for path, identity in created:

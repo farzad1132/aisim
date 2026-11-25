@@ -219,6 +219,10 @@ def _check_manifest_any(root: Path, rel: str, category: str):
         return load_e2e(root, rel).manifest
     if category in ("op-latency", "fpm"):
         return check_manifest(root, rel)
+    if category == "host-cost":
+        from aisim_core.data.host_cost import check_entry
+
+        return check_entry(root, rel)
     manifest = Manifest.model_validate_json((root / rel).read_bytes())
     if manifest.configuration_id != configuration_id(manifest.category, manifest.purpose, manifest.identity):
         raise ValueError("configuration identity hash mismatch")

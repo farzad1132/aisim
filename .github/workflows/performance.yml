@@ -200,6 +200,9 @@ jobs:
           python -m venv "${HEAD_VENV}"
           "${BASE_VENV}/bin/python" -m pip install "${BASE_DIST}"/*.whl
           "${HEAD_VENV}/bin/python" -m pip install "${HEAD_DIST}"/*.whl
+          # Keep the dataset download out of the timed prewarm batch.
+          "${BASE_VENV}/bin/python" scripts/performance/prefetch_op_latency.py
+          "${HEAD_VENV}/bin/python" scripts/performance/prefetch_op_latency.py
 
       - name: Run paired benchmark
         if: steps.revisions.outputs.run_comparison == 'true'

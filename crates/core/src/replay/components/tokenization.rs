@@ -9,6 +9,11 @@
 //! `base_ms + per_input_token_ms * input_tokens`. Because service is
 //! non-preemptive and first-come, first-served, a request's release time is
 //! known when it enters.
+//!
+//! The same stage also carries an unqueued extra CPU overhead (HTTP receive,
+//! first-chunk work): `extra_base_ms + extra_per_input_token_ms * input_tokens`
+//! added to the release time without occupying a tokenizer server, so it never
+//! queues behind other requests.
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -16,26 +21,56 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use anyhow::{Result, ensure};
 use uuid::Uuid;
 
-/// Tokenization cost and concurrency for every worker of the entry role.
+/// Unqueued extra CPU overhead ahead of the engine, per request.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ExtraCpuOverhead {
+    pub(crate) base_ms: f64,
+    pub(crate) per_input_token_ms: f64,
+}
+
+/// Tokenization cost and concurrency for every worker of the entry role, plus
+/// an unqueued extra overhead.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TokenizationLatency {
     workers: usize,
     base_ms: f64,
     per_input_token_ms: f64,
+    extra_base_ms: f64,
+    extra_per_input_token_ms: f64,
 }
 
 impl TokenizationLatency {
-    /// Returns `None` when both costs are zero, which keeps direct dispatch.
-    pub(crate) fn new(workers: usize, base_ms: f64, per_input_token_ms: f64) -> Option<Self> {
-        (base_ms > 0.0 || per_input_token_ms > 0.0).then_some(Self {
+    /// Returns `None` when every cost is zero, which keeps direct dispatch.
+    /// With only an extra overhead the tokenizer service time is zero, so the
+    /// worker count does not matter.
+    pub(crate) fn new(
+        tokenization: Option<(usize, f64, f64)>,
+        extra: Option<ExtraCpuOverhead>,
+    ) -> Option<Self> {
+        let (workers, base_ms, per_input_token_ms) = tokenization.unwrap_or((1, 0.0, 0.0));
+        let extra = extra.unwrap_or(ExtraCpuOverhead {
+            base_ms: 0.0,
+            per_input_token_ms: 0.0,
+        });
+        let active = base_ms > 0.0
+            || per_input_token_ms > 0.0
+            || extra.base_ms > 0.0
+            || extra.per_input_token_ms > 0.0;
+        active.then_some(Self {
             workers,
             base_ms,
             per_input_token_ms,
+            extra_base_ms: extra.base_ms,
+            extra_per_input_token_ms: extra.per_input_token_ms,
         })
     }
 
     fn service_ms(self, input_tokens: usize) -> f64 {
         self.base_ms + self.per_input_token_ms * input_tokens as f64
+    }
+
+    fn extra_ms(self, input_tokens: usize) -> f64 {
+        self.extra_base_ms + self.extra_per_input_token_ms * input_tokens as f64
     }
 }
 
@@ -100,7 +135,8 @@ impl<T> TokenizationStage<T> {
             Some(Reverse(FreeAt(free_at_ms))) if reuse_server => now_ms.max(*free_at_ms),
             _ => now_ms,
         };
-        let release_at_ms = start_ms + self.latency.service_ms(input_tokens);
+        let free_at_ms = start_ms + self.latency.service_ms(input_tokens);
+        let release_at_ms = free_at_ms + self.latency.extra_ms(input_tokens);
         ensure!(
             release_at_ms.is_finite(),
             "tokenization of {input_tokens} input tokens does not finish in finite time"
@@ -108,7 +144,7 @@ impl<T> TokenizationStage<T> {
         if reuse_server {
             busy.pop();
         }
-        busy.push(Reverse(FreeAt(release_at_ms)));
+        busy.push(Reverse(FreeAt(free_at_ms)));
         self.pending_ids.insert(request_id);
         self.pending.push(Pending {
             release_at_ms,
@@ -197,7 +233,7 @@ mod tests {
     use super::*;
 
     fn stage(workers: usize) -> TokenizationStage<&'static str> {
-        TokenizationStage::new(TokenizationLatency::new(workers, 1.0, 0.5).unwrap())
+        TokenizationStage::new(TokenizationLatency::new(Some((workers, 1.0, 0.5)), None).unwrap())
     }
 
     #[test]
@@ -263,8 +299,9 @@ mod tests {
 
     #[test]
     fn a_huge_server_count_tracks_only_used_servers() {
-        let mut stage =
-            TokenizationStage::new(TokenizationLatency::new(usize::MAX, 1.0, 0.0).unwrap());
+        let mut stage = TokenizationStage::new(
+            TokenizationLatency::new(Some((usize::MAX, 1.0, 0.0)), None).unwrap(),
+        );
         assert_eq!(
             stage.enter(0.0, 0, 0, Uuid::from_u128(9), "first").unwrap(),
             1.0
@@ -280,7 +317,9 @@ mod tests {
 
     #[test]
     fn a_non_finite_release_time_is_rejected_without_state_changes() {
-        let mut stage = TokenizationStage::new(TokenizationLatency::new(1, 0.0, f64::MAX).unwrap());
+        let mut stage = TokenizationStage::new(
+            TokenizationLatency::new(Some((1, 0.0, f64::MAX)), None).unwrap(),
+        );
         assert!(
             stage
                 .enter(0.0, 0, 2, Uuid::from_u128(11), "overflow")
@@ -314,6 +353,48 @@ mod tests {
 
     #[test]
     fn zero_costs_disable_the_stage() {
-        assert_eq!(TokenizationLatency::new(1, 0.0, 0.0), None);
+        assert_eq!(TokenizationLatency::new(Some((1, 0.0, 0.0)), None), None);
+        assert_eq!(TokenizationLatency::new(None, None), None);
+    }
+
+    #[test]
+    fn extra_overhead_delays_release_without_occupying_a_server() {
+        let extra = ExtraCpuOverhead {
+            base_ms: 10.0,
+            per_input_token_ms: 0.25,
+        };
+        let mut stage = TokenizationStage::new(
+            TokenizationLatency::new(Some((1, 1.0, 0.5)), Some(extra)).unwrap(),
+        );
+        // Service 33 ms on the server, then 10 + 16 ms of extra overhead.
+        assert_eq!(
+            stage
+                .enter(0.0, 0, 64, Uuid::from_u128(20), "long")
+                .unwrap(),
+            59.0
+        );
+        // The server frees at 33 ms, not 59 ms: the short request starts then.
+        assert_eq!(
+            stage
+                .enter(0.0, 0, 4, Uuid::from_u128(21), "short")
+                .unwrap(),
+            33.0 + 3.0 + 11.0
+        );
+    }
+
+    #[test]
+    fn extra_overhead_alone_never_queues() {
+        let extra = ExtraCpuOverhead {
+            base_ms: 5.0,
+            per_input_token_ms: 0.0,
+        };
+        let mut stage =
+            TokenizationStage::new(TokenizationLatency::new(None, Some(extra)).unwrap());
+        for id in 30..34 {
+            assert_eq!(
+                stage.enter(0.0, 0, 100, Uuid::from_u128(id), "x").unwrap(),
+                5.0
+            );
+        }
     }
 }

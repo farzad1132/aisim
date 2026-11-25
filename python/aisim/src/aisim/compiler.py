@@ -259,6 +259,13 @@ def _tokenization(engine: EnginePredictionConfig) -> dict[str, JSONValue] | None
     }
 
 
+def _extra_cpu_overhead(engine: EnginePredictionConfig) -> dict[str, JSONValue] | None:
+    extra = getattr(engine, "extra_cpu_overhead", None)
+    if extra is None or not extra.active:
+        return None
+    return {"base_ms": extra.base_ms, "per_input_token_ms": extra.per_input_token_us / 1000.0}
+
+
 def _detokenization(engine: EnginePredictionConfig) -> dict[str, JSONValue] | None:
     detokenization = getattr(engine, "detokenization", None)
     if detokenization is None or not detokenization.active:
@@ -327,6 +334,7 @@ def _deployment(
         "backend": engine.backend,
         "backend_version": engine.backend_version or "",
         "tokenization": _tokenization(engine),
+        "extra_cpu_overhead": _extra_cpu_overhead(engine),
         "detokenization": _detokenization(engine),
     }
     if mode == "agg":

@@ -88,6 +88,14 @@ _CREDENTIAL_KEY = re.compile(
 _IMAGE_KEY = re.compile(r"(^|_)(image|images|container|docker_image)(_|$)", re.I)
 _PATCH_KEY = re.compile(r"(^|_)patch(es)?($|_)", re.I)
 _RUN_KEY = re.compile(r"(^|_)run_url$|^producer_id$", re.I)
+# Cluster facts that identify a machine or a scheduler job: they stay in ``aisim-data-internal``.
+_CLUSTER_KEY = re.compile(
+    r"^(hostnames?|host_names?|node_?names?|node_?list|job_ids?|slurm_(job_ids?|job_name|nodelist|node_?names?)"
+    r"|load_average(_[a-z0-9]+)?)$",
+    re.I,
+)
+_CLUSTER_HOST = re.compile(r"\b[\w-]+-slurm-[\w-]+\b", re.I)
+_LOCAL_PATH = re.compile(r"(?:^|[\s\"'=:(])/(?:workspace|lustre|gpfs|scratch|raid|home|mnt|data)/", re.I)
 
 
 @dataclass(frozen=True)
@@ -217,7 +225,9 @@ def _walk(value: Any, key: str = "", seen: set[tuple[int, str]] | None = None) -
             yield from _walk(v, key, seen)
     elif isinstance(value, str):
         yield key, value
-    elif value is not None and _CREDENTIAL_KEY.search(key) and not isinstance(value, bytes):
+    elif (
+        value is not None and not isinstance(value, bytes) and (_CREDENTIAL_KEY.search(key) or _CLUSTER_KEY.search(key))
+    ):
         yield key, str(value)
     elif isinstance(value, bytes):
         # Binary extension columns and Arrow metadata must not bypass disclosure
@@ -235,7 +245,7 @@ def _json_text(text: str) -> Any:
 
 
 def scan_value(value: Any, policy: RedactionPolicy, path: str, where: str, *, _key: str = "") -> list[Finding]:
-    """Findings for run URLs, images, digests, patch references, secrets and internal hosts."""
+    """Findings for run URLs, images, digests, patch references, secrets, internal hosts, cluster facts, local paths."""
     out: list[Finding] = []
 
     def flag(code: str, detail: str) -> None:
@@ -272,8 +282,12 @@ def scan_value(value: Any, policy: RedactionPolicy, path: str, where: str, *, _k
             flag("patch-reference", "patch reference or diff text must be removed")
         if _SECRET.search(text) or _URL_PASSWORD.search(text):
             flag("secret", "credential-like text")
-        if _INTERNAL_HOST.search(text):
+        if _INTERNAL_HOST.search(text) or _CLUSTER_HOST.search(text):
             flag("internal-host", "internal host name")
+        if _CLUSTER_KEY.search(key):
+            flag("cluster-detail", "host names, scheduler job IDs and node load stay internal")
+        if _LOCAL_PATH.search(text):
+            flag("local-path", "a path on the collection host must be replaced by a public identifier")
     return out
 
 

@@ -304,8 +304,10 @@
 /.agents/skills/aisim-benchmark-evaluate/              @ai-dynamo/aisim-forward-pass-engine-codeowners @ai-dynamo/aisim-infra-codeowners @ai-dynamo/access-aisim-maintain
 /.agents/skills/aisim-replay-performance/              @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-mocker-codeowners @ai-dynamo/access-aisim-maintain
 /python/aisim/tools/simulation_perf_gate/              @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-forward-pass-engine-codeowners @ai-dynamo/aisim-infra-codeowners @ai-dynamo/access-aisim-maintain
+/.claude/skills/aisim-cpu-overhead-collect             @ai-dynamo/aisim-forward-pass-engine-codeowners @ai-dynamo/aisim-replay-codeowners @ai-dynamo/access-aisim-maintain
 /.github/workflows/request-nvskills-ci.yml             @ai-dynamo/aisim-infra-codeowners @ai-dynamo/access-aisim-maintain
 /python/aisim/src/aisim/resource_worker.py             @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-sweeper-codeowners @ai-dynamo/access-aisim-maintain
+/.agents/skills/aisim-cpu-overhead-collect/            @ai-dynamo/aisim-forward-pass-engine-codeowners @ai-dynamo/aisim-replay-codeowners @ai-dynamo/access-aisim-maintain
 /python/aisim/src/aisim/resource_scheduler.py          @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-sweeper-codeowners @ai-dynamo/access-aisim-maintain
 /python/aisim/.github/workflows/codeowners.yml         @ai-dynamo/aisim-infra-codeowners @ai-dynamo/access-aisim-maintain
 /tests/fixtures/aiperf_0.13.0_request_metrics.json     @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-sweeper-codeowners @ai-dynamo/access-aisim-maintain

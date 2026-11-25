@@ -13,17 +13,6 @@ fn config(speculation: Value, nextn: u32) -> Value {
     })
 }
 
-fn generic_config() -> bool {
-    match std::env::var("AIS_CALLBACK_GENERIC_CONFIG")
-        .unwrap()
-        .as_str()
-    {
-        "1" => true,
-        "0" => false,
-        other => panic!("unexpected API shape: {other}"),
-    }
-}
-
 fn assert_decode(config: Value, expected_depth: u32) {
     let callback = build_model(&config).unwrap();
     assert_eq!(callback.nextn, expected_depth);
@@ -70,49 +59,38 @@ fn ngram_depth_reaches_actual_decode() {
 }
 
 #[test]
-fn disabled_identity_obeys_selected_core_schema() {
-    let value = config(json!({"kind": "none"}), 0);
-    if generic_config() {
-        assert_decode(value, 0);
-        assert_decode(config(json!({"kind": "none", "params": {}}), 0), 0);
-    } else {
-        let error = build_model(&value)
-            .err()
-            .expect("legacy enum must reject none");
-        assert!(error.to_string().contains("invalid AIS perf config"));
-    }
-}
-
-#[test]
-fn malformed_disabled_identity_and_legacy_conflict_are_rejected() {
+fn schemes_other_than_ngram_are_rejected() {
     for spec in [
-        json!({"kind": "none", "params": {"depth": 1}}),
-        json!({"kind": "none", "draft_config": {}}),
-        json!({"kind": "none", "draft_model_path": "must-not-be-loaded"}),
+        json!({"kind": "none"}),
+        json!({"kind": "none", "params": {}}),
+        json!({"kind": "mtp", "params": {"depth": 1}}),
     ] {
-        assert!(build_model(&config(spec, 0)).is_err());
+        let error = build_model(&config(spec.clone(), 0))
+            .err()
+            .unwrap_or_else(|| panic!("{spec} must not enable replay"));
+        assert!(
+            error
+                .to_string()
+                .contains("only ngram speculation or legacy nextn"),
+            "{error}"
+        );
     }
-    assert!(build_model(&config(json!({"kind": "none"}), 1)).is_err());
 }
 
 #[test]
-fn unsupported_scheme_and_invalid_ngram_depth_are_rejected() {
-    let error = build_model(&config(json!({"kind": "mtp", "params": {"depth": 1}}), 0))
+fn invalid_ngram_depth_is_rejected() {
+    for depth in [json!(-1), json!(1.5), json!(true), json!("1"), json!(u64::from(u32::MAX) + 1)] {
+        let error = build_model(&config(
+            json!({"kind": "ngram", "params": {"num_speculative_tokens": depth.clone()}}),
+            0,
+        ))
         .err()
-        .expect("cost-only schemes must not enable replay");
-    let expected = if generic_config() {
-        "Dynamo replay requires ngram speculation or legacy nextn"
-    } else {
-        "invalid AIS perf config"
-    };
-    assert!(error.to_string().contains(expected), "{error}");
-    for depth in [json!(0), json!(6), json!(1.5), json!(true), json!("1")] {
+        .unwrap_or_else(|| panic!("ngram depth {depth} must be rejected"));
         assert!(
-            build_model(&config(
-                json!({"kind": "ngram", "params": {"num_speculative_tokens": depth}}),
-                0
-            ))
-            .is_err()
+            error
+                .to_string()
+                .contains("num_speculative_tokens must be a nonnegative u32"),
+            "{error}"
         );
     }
 }

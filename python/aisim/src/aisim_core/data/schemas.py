@@ -34,6 +34,7 @@ from aisim_core.data.e2e import (
 from aisim_core.data.eval import EvalRecord
 from aisim_core.data.fpm_library import FpmLibraryMetadata, FpmLibraryRow, FpmMeasurementManifest
 from aisim_core.data.gpu_time import GpuTime
+from aisim_core.data.host_cost import HostCostRow
 from aisim_core.data.op_schema import (
     OpDeclaredReuseRow,
     OpLatencyRow,
@@ -67,6 +68,7 @@ SCHEMA_MODELS: dict[str, type[BaseModel]] = {
     "aic_fpm_forward_perf/v6": FpmLibraryRow,
     "aic_fpm_forward_perf.metadata/v6": FpmLibraryMetadata,
     "measurement-manifest/v5": FpmMeasurementManifest,
+    "aisim-host-cost/v1": HostCostRow,
     "aisim-op-declared-reuse/v1": OpDeclaredReuseRow,
     "aisim-op-latency/v1": OpLatencyRow,
     "aisim-op-query-versions/v1": OpQueryVersionsRow,

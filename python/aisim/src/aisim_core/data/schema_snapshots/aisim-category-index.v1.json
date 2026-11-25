@@ -95,7 +95,8 @@
             "execution-profile",
             "e2e-configuration",
             "evaluation-record",
-            "system-spec"
+            "system-spec",
+            "host-cost-profile"
           ],
           "title": "Purpose",
           "type": "string"
@@ -292,7 +293,8 @@
         "fpm",
         "e2e",
         "eval",
-        "systems"
+        "systems",
+        "host-cost"
       ],
       "title": "Category",
       "type": "string"

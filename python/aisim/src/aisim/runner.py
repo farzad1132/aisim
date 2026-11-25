@@ -391,6 +391,10 @@ class EngineReplayRunner:
             if "spec" not in execution_spec:
                 execution_spec = {"spec": execution_spec}
             execution_spec["tokenization"] = dict(spec.backend_deployment.tokenization)
+        if spec.backend_deployment.extra_cpu_overhead is not None:
+            if "spec" not in execution_spec:
+                execution_spec = {"spec": execution_spec}
+            execution_spec["extra_cpu_overhead"] = dict(spec.backend_deployment.extra_cpu_overhead)
         if spec.backend_deployment.detokenization is not None:
             if "spec" not in execution_spec:
                 execution_spec = {"spec": execution_spec}

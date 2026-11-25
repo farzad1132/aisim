@@ -2391,6 +2391,7 @@ OTHER_OWN_ENGINE_FIELDS = {
         "decoder_replay",
         "detokenization",
         "enable_shared_layer",
+        "extra_cpu_overhead",
         "hardware",
         "kv_transfer",
         "mode",

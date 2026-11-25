@@ -1,0 +1,50 @@
+{
+  "b300_sxm": {
+    "login": "aws-pdx-slurm-1-login-01.nvidia.com",
+    "storage": "/lustre/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/simonec",
+    "account": "coreai_comparch_inferencex",
+    "partition": "batch",
+    "qos": "normal",
+    "images": {
+      "vllm": "vllm-0310-cu130-a4a4c043.sqsh",
+      "sglang": "sglang-0521-2dbe4c7f.sqsh",
+      "trtllm": "trtllm-130rc29-e9dab9fc.sqsh"
+    }
+  },
+  "b200_sxm": {
+    "login": "nsc-svg-slurm-1-login-02.nvidia.com",
+    "storage": "/lustre/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/simonec",
+    "account": "coreai_comparch_inferencex",
+    "partition": "batch",
+    "qos": "normal",
+    "images": {
+      "vllm": "pr664-cost-vllm0310-amd64-a4a4c043.sqsh",
+      "sglang": "pr664-cost-sglang0521-amd64-2dbe4c7f.sqsh",
+      "trtllm": "pr664-cost-trtllmrc29-amd64-e9dab9fc.sqsh"
+    }
+  },
+  "h200_sxm": {
+    "login": "neb-cdg-slurm-1-login-02.nvidia.com",
+    "storage": "/lustre/fsw/portfolios/coreai/projects/coreai_comparch_lights-out-inf/users/simonec",
+    "account": "coreai_comparch_lights-out-inf",
+    "partition": "batch",
+    "qos": "normal",
+    "images": {
+      "vllm": "pr664-cost-vllm0310-amd64-a4a4c043.sqsh",
+      "sglang": "pr664-cost-sglang0521-amd64-2dbe4c7f.sqsh",
+      "trtllm": "pr664-cost-trtllmrc29-amd64-e9dab9fc.sqsh"
+    }
+  },
+  "h100_sxm": {
+    "login": "aws-iad-slurm-2-login-02.nvidia.com",
+    "storage": "/lustre/fsw/portfolios/coreai/projects/coreai_comparch_lights-out-inf/users/simonec",
+    "account": "coreai_comparch_lights-out-inf",
+    "partition": "batch",
+    "qos": "normal",
+    "images": {
+      "vllm": "pr664-cost-vllm0310-amd64-a4a4c043.sqsh",
+      "sglang": "pr664-cost-sglang0521-amd64-2dbe4c7f.sqsh",
+      "trtllm": "pr664-cost-trtllmrc29-amd64-e9dab9fc.sqsh"
+    }
+  }
+}

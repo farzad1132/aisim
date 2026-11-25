@@ -213,6 +213,9 @@ class BackendDeploymentSpec:
     # Per-worker tokenization: ``{"workers", "base_ms", "per_input_token_ms"}``.
     # Omitted from canonical JSON when unset, so existing spec identities hold.
     tokenization: dict[str, JSONValue] | None = field(default=None, metadata={OMIT_IF_NONE: True})
+    # Unqueued request-path CPU overhead: ``{"base_ms", "per_input_token_ms"}``.
+    # Omitted from canonical JSON when unset.
+    extra_cpu_overhead: dict[str, JSONValue] | None = field(default=None, metadata={OMIT_IF_NONE: True})
     # Per-worker detokenization: ``{"workers", "base_ms", "per_output_ms"}``.
     # Omitted from canonical JSON when unset.
     detokenization: dict[str, JSONValue] | None = field(default=None, metadata={OMIT_IF_NONE: True})
@@ -711,6 +714,11 @@ class RunnerCapabilities:
                 raise ValueError("runner does not support engine.tokenization; use --stack engine")
             if spec.execution_mode != "offline":
                 raise ValueError("engine.tokenization requires offline replay")
+        if deployment.extra_cpu_overhead is not None:
+            if not self.supports_tokenization:
+                raise ValueError("runner does not support engine.extra_cpu_overhead; use --stack engine")
+            if spec.execution_mode != "offline":
+                raise ValueError("engine.extra_cpu_overhead requires offline replay")
         if deployment.detokenization is not None:
             if is_afd:
                 raise ValueError("engine.detokenization is unsupported for AFD")

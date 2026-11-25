@@ -24,7 +24,7 @@ use crate::replay::artifact::{
 };
 use crate::replay::components::{
     AdmissionQueue, DEFAULT_MAX_SOURCE_STEPS_PER_INSTANT, DetokenizationLatency,
-    DetokenizationStage, DpRankLimits, NoReplayMetadata, ReplayAdmissionMetadata,
+    DetokenizationStage, DpRankLimits, ExtraCpuOverhead, NoReplayMetadata, ReplayAdmissionMetadata,
     ReplayEngineObservation, ReplayMode, TokenizationLatency,
 };
 use crate::replay::core::round_robin::{AggregatedRoundRobinPlacement, PoolRoundRobinPlacement};
@@ -361,7 +361,8 @@ pub struct Replayer<C = RoundRobinComposition> {
     capture: ReplayCaptureOptions,
     telemetry: Option<(f64, Box<dyn ReplayTelemetryObserver>)>,
     telemetry_capture_interval_ms: Option<f64>,
-    tokenization: Option<TokenizationLatency>,
+    tokenization: Option<(usize, f64, f64)>,
+    extra_cpu_overhead: Option<ExtraCpuOverhead>,
     detokenization: Option<DetokenizationLatency>,
     max_source_steps_per_instant: NonZeroU32,
 }
@@ -414,6 +415,7 @@ impl<C: ReplayComposition> Replayer<C> {
             telemetry: None,
             telemetry_capture_interval_ms: None,
             tokenization: None,
+            extra_cpu_overhead: None,
             detokenization: None,
             max_source_steps_per_instant: DEFAULT_MAX_SOURCE_STEPS_PER_INSTANT,
         })
@@ -488,7 +490,35 @@ impl<C: ReplayComposition> Replayer<C> {
                 )));
             }
         }
-        self.tokenization = TokenizationLatency::new(workers, base_ms, per_input_token_ms);
+        self.tokenization = Some((workers, base_ms, per_input_token_ms));
+        Ok(self)
+    }
+
+    /// Add an unqueued CPU overhead before the engine sees each request:
+    /// `base_ms + per_input_token_ms * input_tokens`. It models work that does
+    /// not contend with tokenization (HTTP receive, first-chunk processing), so
+    /// it delays every request by the same amount whatever the load. Latency
+    /// metrics still start at arrival. Both costs zero, the default, adds
+    /// nothing. It composes with [`Self::with_tokenization`].
+    pub fn with_extra_cpu_overhead(
+        mut self,
+        base_ms: f64,
+        per_input_token_ms: f64,
+    ) -> ReplayResult<Self> {
+        for (name, value) in [
+            ("extra_cpu_overhead base_ms", base_ms),
+            ("extra_cpu_overhead per_input_token_ms", per_input_token_ms),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(ReplayError::InvalidSpec(format!(
+                    "{name} must be finite and non-negative, got {value}"
+                )));
+            }
+        }
+        self.extra_cpu_overhead = Some(ExtraCpuOverhead {
+            base_ms,
+            per_input_token_ms,
+        });
         Ok(self)
     }
 
@@ -675,7 +705,7 @@ impl<C: ReplayComposition> Replayer<C> {
                 Some((encoder.clone(), timing.clone()))
             }
         };
-        let tokenization = self.tokenization;
+        let tokenization = TokenizationLatency::new(self.tokenization, self.extra_cpu_overhead);
         if tokenization.is_some()
             && (scaling.is_some() || self.spec.adapters.scaling.provider != "none")
         {

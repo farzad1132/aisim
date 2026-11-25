@@ -489,9 +489,10 @@ These source files are licensed under the Apache License, Version 2.0; see the
 
 ## vLLM
 
-Selected synchronous MTP scheduling, uniform full-attention KV allocation, and
-host-offload behaviors in the following repository-root paths are adapted and
-modified from vLLM `v0.32.0` at commit
+Selected synchronous MTP scheduling, uniform full-attention KV allocation,
+host-offload behaviors, and the async engine's CPU-tier load polling in the
+following repository-root paths are adapted and modified from vLLM `v0.32.0` at
+commit
 `5df63a7203cdb9328d824a27b682e77c7b9928be`:
 
 - `crates/core/src/engine/cache/vllm_block_pool.rs`
@@ -503,9 +504,10 @@ modified from vLLM `v0.32.0` at commit
 - `crates/core/src/engine/scheduler/vllm/tests.rs`
 - `crates/core/src/engine/scheduler/vllm/mtp_offload_tests.rs`
 - `crates/core/src/engine/scheduler/vllm/native_mtp_tests.rs`
-- `docs/replay/engine/kv-cache.md` (MTP with host offload)
+- `docs/replay/engine/kv-cache.md` (MTP with host offload; CPU-tier loads)
 - `docs/replay/engine/speculation.md` (MTP with host offload)
 - `docs/replay/features.md` (MTP/G2 composition boundaries)
+- `docs/replay/engine/workers.md` (CPU-tier loads)
 
 Upstream source and regression scenarios:
 
@@ -516,6 +518,13 @@ Upstream source and regression scenarios:
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/tests/v1/kv_connector/unit/offloading_connector/test_scheduler.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/core.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/worker/gpu/model_runner.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/worker/gpu/kv_connector.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/kv_offload/cpu/gpu_worker.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/simple_kv_offload/copy_backend.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/simple_kv_offload/manager.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/simple_kv_offload/worker.py
 
 Copyright contributors to the vLLM project.
 
@@ -2323,110 +2332,22 @@ retain their raw JSONL request values, dependencies, hashes, and timestamps.
 See the adjacent fixture README and `agentx.json` manifest for the source,
 play identities, counts, and content checksum.
 
-## NVIDIA Dynamo CI handoff compatibility
-
-The exact-source rewrite in `scripts/performance/build_simulation_dynamo.py`
-is adapted and modified from NVIDIA Dynamo's `lib/mocker/src/common/handoff.rs`
-at commit `def3b79b15c266805540a678dd400aeb6ccada1d`:
-https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/lib/mocker/src/common/handoff.rs
-
-Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-Licensed under Apache-2.0; the full license is reproduced in `LICENSE`.
-Upstream license: https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/LICENSE
-The adaptation adds zero recurrent-state bytes to the legacy token-only DTO
-conversion for CI builds against the newer AISim handoff API. It preserves
-the upstream copyright header and marks the modified conversion in the output.
-
-## NVIDIA Dynamo CI struct-literal compatibility
-
-The exact-source rewrites in `scripts/performance/build_simulation_dynamo.py`
-and their regression fixtures in `tests/test_ci_workflow_contracts.py`
-are adapted and modified from NVIDIA Dynamo's
-`lib/mocker/src/grouped_scheduler/compatibility.rs` and
-`lib/mocker/src/replay/offline/extensions/kv_router/mod.rs`,
-`lib/mocker/src/replay/offline/entrypoints.rs`,
-`lib/mocker/src/replay/offline/extensions/kv_events/mod.rs`, and
-`lib/bindings/python/rust/llm/replay.rs` at commit
-`def3b79b15c266805540a678dd400aeb6ccada1d`:
-https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/lib/mocker/src/grouped_scheduler/compatibility.rs
-https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/lib/mocker/src/replay/offline/extensions/kv_router/mod.rs
-https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/lib/mocker/src/replay/offline/entrypoints.rs
-https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/lib/mocker/src/replay/offline/extensions/kv_events/mod.rs
-https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/lib/bindings/python/rust/llm/replay.rs
-
-Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-Licensed under Apache-2.0; the full license is reproduced in `LICENSE`.
-Upstream license: https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/LICENSE
-The adaptation adds `None` for new optional AISim fields to the native
-request and offline KV-router placement struct literals for CI builds against
-newer AISim APIs. It also sets an empty image list for the pinned text-only
-request when AISim requires `images: Vec<ImageSpec>`, rejecting image inputs
-instead of adding multimodal support to Dynamo's adapter. Both offline replay
-specifications disable the encoder pool; the Python binding's synthetic trace
-explicitly retains text-only traffic with `images: None`. The lifecycle conversion explicitly
-rejects host-loop TTFT milestones, which its legacy DTO cannot represent.
-The Weka import adapter retains the default recorded client when the AISim
-API adds the client selection field.
-It preserves the upstream copyright headers and marks each modification in the output.
-
-The replay compatibility rewrite in the same script adapts
-`lib/mocker/src/engine_adapter.rs` at that same immutable revision:
-https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/lib/mocker/src/engine_adapter.rs
-Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-Licensed under Apache-2.0 as above. The modified adapter explicitly sets prefill
-context parallelism to 1 in four replay descriptors, preserving the pinned
-adapter's topology. It also disables the SGLang host loop and takes the vision
-cache capacity from the canonical SGLang default, preserving text-only behavior.
-Its upstream copyright header is retained and each modified literal is marked
-in the generated output.
-
-## NVIDIA Dynamo CI speculation compatibility
-
-The exact-source rewrite in `scripts/performance/build_simulation_dynamo.py`
-and its regression fixture in `tests/test_ci_workflow_contracts.py` are adapted
-and modified from NVIDIA Dynamo's
-`lib/bindings/python/rust/llm/ais_callback.rs` at commit
-`def3b79b15c266805540a678dd400aeb6ccada1d`:
-https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/lib/bindings/python/rust/llm/ais_callback.rs
-
-Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-Licensed under Apache-2.0; the full license is reproduced in `LICENSE`.
-Upstream license: https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/LICENSE
-The adaptation reads the serialized Ngram identity instead of the removed
-enum accessor, retaining legacy `nextn`, accepting disabled speculation, and
-rejecting other replay schemes.
-It preserves the upstream copyright header and marks the modified conversion
-in the output.
+## NVIDIA Dynamo CI callback contract
 
 The callback contract harness in `scripts/performance/check_dynamo_callback.py`
-compiles that entire adapted callback with the real AISim core. Its minimal
-trait interfaces are adapted from `lib/mocker/src/common/perf_model.rs` and
-`lib/kv-router/src/scheduling/prefill_load.rs` at the same immutable commit:
-https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/lib/mocker/src/common/perf_model.rs
-https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/lib/kv-router/src/scheduling/prefill_load.rs
-
-These files carry the same NVIDIA copyright and Apache-2.0 license above.
-The harness modifies their module placement to test the callback independently
-of the Dynamo scheduler; it does not replace callback or estimator behavior.
-
-## NVIDIA Dynamo CI pyo3 compatibility
-
-The exact-source rewrites in `scripts/performance/build_simulation_dynamo.py`
-(`patch_pyo3_bindings`) and their regression fixtures in
-`tests/test_ci_workflow_contracts.py` are adapted and modified from NVIDIA
-Dynamo's Python bindings, `lib/bindings/python/Cargo.toml` and the Rust
-sources under `lib/bindings/python/rust/`, at commit
-`def3b79b15c266805540a678dd400aeb6ccada1d`:
-https://github.com/ai-dynamo/dynamo/tree/def3b79b15c266805540a678dd400aeb6ccada1d/lib/bindings/python
+compiles NVIDIA Dynamo's `lib/bindings/python/rust/llm/ais_callback.rs` at commit
+`df666fbc6284e540ea0f5cac613da7f992b1fc7b` with the real AISim core. It does not change the
+callback. It only appends the AISim contract tests to a temporary copy. Its
+minimal trait interfaces are adapted from `lib/mocker/src/common/perf_model.rs`
+and `lib/router/scheduler/src/prefill_load.rs` at the same immutable commit:
+https://github.com/ai-dynamo/dynamo/blob/df666fbc6284e540ea0f5cac613da7f992b1fc7b/lib/mocker/src/common/perf_model.rs
+https://github.com/ai-dynamo/dynamo/blob/df666fbc6284e540ea0f5cac613da7f992b1fc7b/lib/router/scheduler/src/prefill_load.rs
 
 Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 Licensed under Apache-2.0; the full license is reproduced in `LICENSE`.
-Upstream license: https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/LICENSE
-The adaptation runs only when the selected AISim core uses pyo3 0.30. It moves
-the CI-built bindings from the pyo3 0.23 API to the pyo3 0.30 API, keeps the
-module's GIL requirement, and keeps the two path return values as `str`. It
-does not change scheduling or estimator behavior. It marks each rewritten file
-with a modification notice below its upstream header.
+Upstream license: https://github.com/ai-dynamo/dynamo/blob/df666fbc6284e540ea0f5cac613da7f992b1fc7b/LICENSE
+The harness modifies their module placement to test the callback independently
+of the Dynamo scheduler; it does not replace callback or estimator behavior.
 
 ## SGLang simulator and HiSim feature definitions
 

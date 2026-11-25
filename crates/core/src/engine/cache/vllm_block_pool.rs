@@ -58,11 +58,9 @@ pub(crate) struct KeyInBlock {
     pub(crate) offset: u32,
 }
 
-/// Opaque identity for a transfer that is still reading request-owned capacity.
-///
-/// The pool deliberately does not know transfer timing. It propagates this
-/// identity with the anonymous capacity backing the source until its caller
-/// reports that the transfer reached a terminal state.
+/// Opaque identity of a transfer reading request-owned capacity. The pool
+/// tracks pending reads and can carry a completed read to the next reservation
+/// of its source. The caller owns transfer timing.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(transparent)]
 pub(crate) struct SourceReuseDependency(u64);
@@ -316,71 +314,64 @@ pub(crate) struct PrefixHit {
     pub(crate) is_active: bool,
 }
 
-/// Scalar anonymous capacity upgrades to dependency tracking only when needed.
-enum FreshCapacity {
-    Untracked(usize),
-    Tracked(Vec<Option<SourceReuseDependency>>),
+/// Anonymous capacity in allocation order. Untagged slots need only a count.
+struct FreshCapacity {
+    count: usize,
+    /// Only slots carrying a prior source read, in ascending slot order.
+    reads: Vec<(usize, SourceReuseDependency)>,
 }
 
 impl FreshCapacity {
-    fn len(&self) -> usize {
-        match self {
-            Self::Untracked(count) => *count,
-            Self::Tracked(capacity) => capacity.len(),
+    fn new(count: usize) -> Self {
+        Self {
+            count,
+            reads: Vec::new(),
         }
+    }
+
+    fn len(&self) -> usize {
+        self.count
     }
 
     fn pop(&mut self) -> Option<Option<SourceReuseDependency>> {
-        match self {
-            Self::Untracked(count) => {
-                if *count == 0 {
-                    None
-                } else {
-                    *count -= 1;
-                    Some(None)
-                }
-            }
-            Self::Tracked(capacity) => capacity.pop(),
-        }
+        self.count = self.count.checked_sub(1)?;
+        let read = self.reads.pop_if(|(slot, _)| *slot == self.count);
+        Some(read.map(|(_, dependency)| dependency))
     }
 
     fn push(&mut self, dependency: Option<SourceReuseDependency>) {
-        match (self, dependency) {
-            (Self::Untracked(count), None) => *count += 1,
-            (Self::Untracked(_), Some(_)) => {
-                panic!("dependency-bearing capacity requires tracking")
-            }
-            (Self::Tracked(capacity), dependency) => capacity.push(dependency),
+        if let Some(read) = dependency {
+            self.reads.push((self.count, read));
         }
+        self.count += 1;
     }
 
     fn take_tail(&mut self, count: usize) -> Self {
-        assert!(count <= self.len(), "prechecked free capacity disappeared");
-        match self {
-            Self::Untracked(available) => {
-                *available -= count;
-                Self::Untracked(count)
-            }
-            Self::Tracked(available) => {
-                let split_at = available.len() - count;
-                Self::Tracked(available.split_off(split_at))
-            }
+        assert!(count <= self.count, "prechecked free capacity disappeared");
+        self.count -= count;
+        if self.reads.is_empty() {
+            return Self::new(count);
         }
+        let boundary = self.reads.partition_point(|(slot, _)| *slot < self.count);
+        let mut reads = if boundary == 0 {
+            std::mem::take(&mut self.reads)
+        } else {
+            self.reads.split_off(boundary)
+        };
+        for (slot, _) in &mut reads {
+            *slot -= self.count;
+        }
+        Self { count, reads }
     }
 
     fn extend(&mut self, returned: Self) {
-        match (self, returned) {
-            (Self::Untracked(current), Self::Untracked(returned)) => *current += returned,
-            (Self::Tracked(current), Self::Untracked(returned)) => {
-                current.resize(current.len() + returned, None);
-            }
-            (Self::Untracked(_), Self::Tracked(_)) => {
-                panic!("tracked reservation returned to an untracked pool")
-            }
-            (Self::Tracked(current), Self::Tracked(mut returned)) => {
-                current.append(&mut returned);
-            }
-        }
+        self.reads.extend(
+            returned
+                .reads
+                .into_iter()
+                .map(|(slot, read)| (self.count + slot, read)),
+        );
+        self.count += returned.count;
     }
 
     fn pending_dependencies(
@@ -389,31 +380,22 @@ impl FreshCapacity {
         pending: Option<&FxHashSet<SourceReuseDependency>>,
     ) -> Vec<SourceReuseDependency> {
         assert!(
-            fresh <= self.len(),
+            fresh <= self.count,
             "fresh dependency query exceeds reservation"
         );
-        match (self, pending) {
-            (Self::Untracked(_), _) => Vec::new(),
-            (Self::Tracked(capacity), Some(pending)) => unique_pending_dependencies(
-                capacity.iter().rev().take(fresh).copied().flatten(),
-                pending,
-            ),
-            (Self::Tracked(capacity), None) => {
-                assert!(
-                    capacity.iter().all(Option::is_none),
-                    "tracked capacity lost its source-reuse sidecar"
-                );
-                Vec::new()
-            }
+        if self.reads.is_empty() {
+            return Vec::new();
         }
-    }
-
-    fn enable_tracking(&mut self) {
-        let Self::Untracked(count) = self else {
-            return;
-        };
-        let count = *count;
-        *self = Self::Tracked(vec![None; count]);
+        let pending = pending.expect("tagged capacity lost its source-reuse sidecar");
+        let first = self.count - fresh;
+        unique_pending_dependencies(
+            self.reads
+                .iter()
+                .rev()
+                .take_while(|(slot, _)| *slot >= first)
+                .map(|(_, read)| *read),
+            pending,
+        )
     }
 }
 
@@ -437,6 +419,11 @@ impl BlockReservation {
 
     pub(crate) fn fresh_len(&self) -> usize {
         self.fresh.len()
+    }
+
+    /// Source reads of the physical capacity reserved for newly written blocks.
+    pub(crate) fn fresh_source_reads(&self) -> impl Iterator<Item = SourceReuseDependency> + '_ {
+        self.fresh.reads.iter().map(|(_, read)| *read)
     }
 
     pub(crate) fn pending_dependencies(
@@ -481,8 +468,7 @@ pub(crate) struct VllmBlockPool {
     /// and those blocks beyond one per copy.
     group_weights: SecondaryMap<BlockCopyId, usize>,
     group_extra_blocks: usize,
-    /// Anonymous currently unoccupied capacity. Only a pending source reader
-    /// follows a token through release, eviction, reservation, and reuse.
+    /// Unoccupied capacity and the source reads its next reservation inherits.
     free: FreshCapacity,
     source_reuse: Option<Box<SourceReuseTracker>>,
     /// See [`Self::hold_pending_sources`].
@@ -509,7 +495,7 @@ impl VllmBlockPool {
             reserved: 0,
             group_weights: SecondaryMap::new(),
             group_extra_blocks: 0,
-            free: FreshCapacity::Untracked(capacity),
+            free: FreshCapacity::new(capacity),
             source_reuse: None,
             hold_sources: false,
             source_release: SourceReleaseOrder::TailFirst,
@@ -841,7 +827,9 @@ impl VllmBlockPool {
         let id = self.copies.insert(BlockCopy {
             state: CopyState::Private,
         });
-        if let Some(dependency) = source_reuse {
+        // A holding pool only hands out a source after its read completes.
+        // A restore inspected that prior read before taking ownership.
+        if let Some(dependency) = source_reuse.filter(|_| !self.hold_sources) {
             let tracker = self
                 .source_reuse
                 .as_deref_mut()
@@ -1047,7 +1035,8 @@ impl VllmBlockPool {
             _ => panic!("state writes require an exclusively owned, unpinned copy"),
         };
         assert!(
-            self.copy_source_reuse(id).is_none(),
+            self.copy_source_reuse(id)
+                .is_none_or(|read| !self.is_source_reuse_dependency_pending(read.dependency)),
             "state copy has a pending reader"
         );
         self.remove_indexed_copy(hash, id);
@@ -1212,10 +1201,6 @@ impl VllmBlockPool {
             self.can_attach_source_reuse_dependency(copies),
             "source copies changed after synchronous validation"
         );
-        // A holding pool never hands out capacity with a pending reader.
-        if !self.hold_sources {
-            self.free.enable_tracking();
-        }
         let tracker = self
             .source_reuse
             .get_or_insert_with(|| Box::new(SourceReuseTracker::default()));
@@ -1250,6 +1235,7 @@ impl VllmBlockPool {
     pub(crate) fn satisfy_source_reuse_dependency(
         &mut self,
         dependency: SourceReuseDependency,
+        retain_source_read: bool,
     ) -> bool {
         let Some(tracker) = self.source_reuse.as_deref_mut() else {
             return false;
@@ -1258,13 +1244,19 @@ impl VllmBlockPool {
             return false;
         }
         if let Some(sources) = tracker.held.remove(&dependency) {
-            self.release_held_sources(sources);
+            self.release_held_sources(sources, retain_source_read.then_some(dependency));
         }
         true
     }
 
     /// Return a satisfied transfer's held capacity in its release order.
-    fn release_held_sources(&mut self, mut sources: Vec<BlockCopyId>) {
+    fn release_held_sources(
+        &mut self,
+        mut sources: Vec<BlockCopyId>,
+        source_read: Option<SourceReuseDependency>,
+    ) {
+        // A backdated restore may need the completed read of its destination.
+        // The pool carries its ID; the connector owns the completion clock.
         if self.source_release == SourceReleaseOrder::TailFirst {
             sources.reverse();
         }
@@ -1273,12 +1265,15 @@ impl VllmBlockPool {
                 .source_reuse
                 .as_deref_mut()
                 .expect("held sources lost their source-reuse sidecar");
-            tracker.by_copy.remove(&id);
-            if tracker.released.remove(&id) {
+            let released = tracker.released.remove(&id);
+            if released || source_read.is_none() {
+                tracker.by_copy.remove(&id);
+            }
+            if released {
                 self.copies
                     .remove(id)
                     .expect("released private source disappeared");
-                self.free.push(None);
+                self.free.push(source_read);
             } else if self.is_inactive(id) {
                 self.insert_inactive(id);
             }
@@ -2395,6 +2390,37 @@ mod tests {
     }
 
     #[test]
+    fn sparse_source_reads_keep_their_slots_when_a_reservation_is_cancelled() {
+        let gap = usize::MAX / 8;
+        let [a, b, c] = [1, 2, 3].map(SourceReuseDependency::from_adapter_id);
+        let mut free = FreshCapacity::new(gap);
+        free.push(Some(a));
+        free.extend(FreshCapacity::new(gap));
+        free.push(Some(b));
+        free.push(None);
+        free.push(Some(c));
+        let mut pool = VllmBlockPool::new(free.len());
+        pool.free = free;
+
+        // Reserve across the large untagged middle, leaving a at its old slot.
+        let reserved = reserve(&mut pool, &[], gap + 3).reservation;
+        assert_eq!(pool.free.reads, [(gap, a)]);
+        assert_eq!(reserved.fresh.reads, [(gap, b), (gap + 2, c)]);
+        let pending = [a, b, c].into_iter().collect();
+        assert_eq!(reserved.pending_dependencies(2, Some(&pending)), [c]);
+        assert_eq!(reserved.pending_dependencies(3, Some(&pending)), [c, b]);
+        pool.cancel(reserved);
+        assert_eq!(
+            pool.free.reads,
+            [(gap, a), (2 * gap + 1, b), (2 * gap + 3, c)]
+        );
+        let mut reused = reserve(&mut pool, &[], 3).reservation;
+        assert_eq!(reused.fresh.pop(), Some(Some(c)));
+        assert_eq!(reused.fresh.pop(), Some(None));
+        assert_eq!(reused.fresh.pop(), Some(Some(b)));
+    }
+
+    #[test]
     fn ordinary_capacity_stays_scalar_until_a_source_dependency_exists() {
         assert_eq!(
             std::mem::size_of::<BlockCopy>(),
@@ -2404,7 +2430,7 @@ mod tests {
         let mut pool = VllmBlockPool::new(2);
         assert!(pool.source_reuse.is_none());
         let mut reservation = reserve(&mut pool, &[], 2).reservation;
-        assert!(matches!(&reservation.fresh, FreshCapacity::Untracked(2)));
+        assert_eq!(reservation.fresh.reads.capacity(), 0);
         let first = pool.allocate_private(&mut reservation);
         let second = pool.allocate_private(&mut reservation);
         assert!(pool.cache_private(first, 1));
@@ -2413,12 +2439,9 @@ mod tests {
         pool.release(second);
 
         let pressure = reserve(&mut pool, &[], 2);
-        assert!(matches!(
-            &pressure.reservation.fresh,
-            FreshCapacity::Untracked(2)
-        ));
+        assert_eq!(pressure.reservation.fresh.reads.capacity(), 0);
         pool.cancel(pressure.reservation);
-        assert!(matches!(&pool.free, FreshCapacity::Untracked(2)));
+        assert_eq!(pool.free.reads.capacity(), 0);
         assert!(
             pool.source_reuse.is_none(),
             "ordinary allocation must not create the host-only sidecar"
@@ -2653,7 +2676,7 @@ mod tests {
         let dependency = SourceReuseDependency::from_adapter_id(41);
         assert!(pool.can_attach_source_reuse_dependency(&[source_id]));
         pool.attach_source_reuse_dependency(&[source_id], dependency);
-        assert!(matches!(&pool.free, FreshCapacity::Tracked(_)));
+        assert!(pool.is_source_reuse_dependency_pending(dependency));
 
         // The source remains an ordinary eviction candidate: its dependency
         // follows the capacity instead of pinning the copy.
@@ -2672,7 +2695,7 @@ mod tests {
             pool.reservation_pending_dependencies(&second),
             vec![dependency]
         );
-        assert!(pool.satisfy_source_reuse_dependency(dependency));
+        assert!(pool.satisfy_source_reuse_dependency(dependency, false));
         assert!(pool.reservation_pending_dependencies(&second).is_empty());
         pool.cancel(second);
     }
@@ -2711,7 +2734,7 @@ mod tests {
         let private = pool.allocate_private(&mut source);
         let dependency = SourceReuseDependency::from_adapter_id(41);
         pool.attach_source_reuse_dependency(&[cached, private], dependency);
-        assert!(matches!(pool.free, FreshCapacity::Untracked(1)));
+        assert_eq!(pool.free.reads.capacity(), 0);
 
         pool.release(private);
         pool.release(cached);
@@ -2725,12 +2748,41 @@ mod tests {
         assert_eq!(pool.num_inactive(), 0);
         pool.assert_lru_consistent();
 
-        assert!(pool.satisfy_source_reuse_dependency(dependency));
+        assert!(pool.satisfy_source_reuse_dependency(dependency, false));
         assert_eq!((pool.num_active(), pool.num_inactive()), (0, 1));
         assert!(!pool.prefix_hit(7).unwrap().is_active);
         assert!(pool.source_reuse.as_deref().unwrap().by_copy.is_empty());
         pool.assert_lru_consistent();
         assert_eq!(reserve(&mut pool, &[], 3).removed, vec![7]);
+    }
+
+    #[test]
+    fn a_held_source_carries_its_completed_read_until_reallocated() {
+        for cached in [false, true] {
+            let mut pool = VllmBlockPool::new(1);
+            pool.hold_pending_sources(SourceReleaseOrder::HeadFirst);
+            let mut reservation = reserve(&mut pool, &[], 1).reservation;
+            let copy = pool.allocate_private(&mut reservation);
+            if cached {
+                pool.cache_private(copy, 7);
+            }
+            let read = SourceReuseDependency::from_adapter_id(13);
+            pool.attach_source_reuse_dependency(&[copy], read);
+            pool.release(copy);
+            assert!(pool.reserve(&[], 1).is_none());
+            assert!(pool.satisfy_source_reuse_dependency(read, true));
+            let available = reserve(&mut pool, &[], 1).reservation;
+            assert!(pool.reservation_pending_dependencies(&available).is_empty());
+            assert_eq!(available.fresh_source_reads().collect::<Vec<_>>(), [read]);
+            pool.cancel(available);
+            let mut available = reserve(&mut pool, &[], 1).reservation;
+            assert_eq!(available.fresh_source_reads().collect::<Vec<_>>(), [read]);
+            let replacement = pool.allocate_private(&mut available);
+            assert!(pool.copy_source_reuse(replacement).is_none());
+            pool.release(replacement);
+            let next = reserve(&mut pool, &[], 1).reservation;
+            assert_eq!(next.fresh_source_reads().next(), None);
+        }
     }
 
     #[test]
@@ -2752,10 +2804,41 @@ mod tests {
             pool.release(unrelated);
 
             // A copy still referenced at satisfaction later returns as usual.
-            assert!(pool.satisfy_source_reuse_dependency(dependency));
+            assert!(pool.satisfy_source_reuse_dependency(dependency, false));
             pool.release(owned);
             pool.assert_lru_consistent();
             assert_eq!(reserve(&mut pool, &[], 4).removed, removed, "{order:?}");
+        }
+    }
+
+    #[test]
+    fn state_privatization_waits_for_the_source_read_to_finish() {
+        for holds_sources in [true, false] {
+            let mut pool = VllmBlockPool::new(1);
+            if holds_sources {
+                pool.hold_pending_sources(SourceReleaseOrder::HeadFirst);
+            }
+            let mut blocks = reserve(&mut pool, &[], 1).reservation;
+            let id = pool.allocate_private(&mut blocks);
+            let key = CacheKey::State { prefix: 7, slot: 0 };
+            pool.cache_private_key(id, key);
+            let read = SourceReuseDependency::from_adapter_id(13);
+            pool.attach_source_reuse_dependency(&[id], read);
+            let premature = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pool.make_state_private(id);
+            }));
+            assert!(premature.is_err());
+            assert!(pool.holds_state_key(id, key));
+            assert!(pool.satisfy_source_reuse_dependency(read, holds_sources));
+            pool.make_state_private(id);
+            assert!(pool.is_private(id));
+            assert!(pool.key_hit(key).is_none());
+            assert!(pool.cache_private_key(id, CacheKey::State { prefix: 8, slot: 0 }));
+            pool.release(id);
+            let next = reserve(&mut pool, &[], 1).reservation;
+            assert_eq!(next.fresh_source_reads().collect::<Vec<_>>(), [read]);
+            assert!(pool.reservation_pending_dependencies(&next).is_empty());
+            pool.cancel(next);
         }
     }
 
@@ -2919,7 +3002,7 @@ mod tests {
         pool.release(produced);
         let next = reserve(&mut pool, &[], 1).reservation;
         assert_eq!(pool.reservation_pending_dependencies(&next), vec![new_read]);
-        assert!(pool.satisfy_source_reuse_dependency(old_read));
+        assert!(pool.satisfy_source_reuse_dependency(old_read, false));
         assert_eq!(pool.reservation_pending_dependencies(&next), vec![new_read]);
         assert!(pool.is_source_reuse_dependency_pending(new_read));
         pool.cancel(next);
@@ -2928,7 +3011,7 @@ mod tests {
             pool.reservation_pending_dependencies(&reacquired),
             vec![new_read]
         );
-        assert!(pool.satisfy_source_reuse_dependency(new_read));
+        assert!(pool.satisfy_source_reuse_dependency(new_read, false));
         assert!(
             pool.reservation_pending_dependencies(&reacquired)
                 .is_empty()
@@ -2951,7 +3034,7 @@ mod tests {
         let mut reservation = reserve(&mut pool, &[], 1).reservation;
         let produced = pool.allocate_private(&mut reservation);
         pool.authorize_source_reuse_writes([produced], &[dependency]);
-        assert!(pool.satisfy_source_reuse_dependency(dependency));
+        assert!(pool.satisfy_source_reuse_dependency(dependency, false));
         assert!(pool.cache_private(produced, 8));
         assert!(
             !pool

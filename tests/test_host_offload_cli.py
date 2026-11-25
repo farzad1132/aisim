@@ -193,6 +193,24 @@ def test_canonical_mtp_host_config_preserves_composition_limits(change, error) -
 
 
 @pytest.mark.usefixtures("raw_data_coordinates")
+def test_canonical_mtp_host_rejects_launch_without_a_recurrent_state_cache() -> None:
+    engine = _mtp_host_engine()
+    worker = engine["workers"]["aggregated"]
+    worker["kv_cache"]["host_offload"]["connector"] = "offloading_v0_32"
+    worker["scheduler"]["launch"] = {
+        "decode_ms": 2,
+        "piecewise_ms": 5,
+        "eager_ms": 10,
+        "max_cudagraph_capture_size": 512,
+        "eager_queue_fraction": 0.4,
+    }
+    # Once the rank's state layout is known, the runner selects synchronous scheduling for this uniform G2.
+    config = CorePredictionConfig.model_validate({"engine": engine})
+    with pytest.raises(RuntimeError, match="launch requires vLLM async_scheduling"):
+        EngineReplayRunnerFactory().create(0).run(prediction_to_replay_spec(config))
+
+
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_canonical_mtp_host_config_takes_attention_dp() -> None:
     engine = _mtp_host_engine()
     engine["workers"]["aggregated"]["parallelism"]["attention_data"] = 2
@@ -864,6 +882,88 @@ def test_predict_cli_spills_to_kvcr_g3_through_the_real_runtime(tmp_path, capsys
     report = json.loads(capsys.readouterr().out)
     assert report["completed_requests"] == 2
     assert report["kvcr"]["g3"]["stored_blocks"] > 0
+
+
+def _polled_cpu_tier_hits_ttft(tmp_path, capsys, connector: str, launch: bool) -> list[float]:
+    """TTFT of each CPU-tier hit in 8 four-turn sessions on the tiny-model fixture through `aisim predict`."""
+    engine = _prediction_engine()
+    engine["model"] = str(ROOT / "tests/e2e/configs/unified_cli/fixtures/tiny-model")
+    engine["context_length"] = 8192
+    worker = engine["workers"]["aggregated"]
+    worker["parallelism"] = {"replicas": 1, "tensor": 1, "attention_data": 1}
+    worker["scheduler"] = {"max_batched_tokens": 8192, "max_sequences": 64}
+    if launch:
+        worker["scheduler"]["launch"] = {
+            "decode_ms": 2,
+            "piecewise_ms": 5,
+            "eager_ms": 10,
+            "max_cudagraph_capture_size": 512,
+            "eager_queue_fraction": 0.4,
+        }
+    worker["kv_cache"] = {
+        "block_size": 16,
+        "prefix_caching": True,
+        "bytes_per_token": 131072,
+        "capacity": {"type": "fixed", "blocks": 1024},
+        "host_offload": {
+            "scope": "dp_rank_local",
+            "num_host_blocks": 16384,
+            "d2h_bandwidth_gbps": 50,
+            "h2d_bandwidth_gbps": 50,
+            "latency_to_first_byte_ms": 0,
+            "connector": connector,
+        },
+    }
+    worker["timing"] = {"type": "fixed", "prefill_ms": 20, "decode_ms": 10}
+    config = {
+        "engine": engine,
+        "traffic": {
+            "source": {
+                "type": "synthetic-session",
+                "new_input_tokens_per_turn": 1024,
+                "output_tokens_per_turn": 64,
+                "session": {"turns": 4, "shared_prefix_ratio": 0, "prefix_groups": 0, "inter_turn_delay_ms": 1000},
+            },
+            "load": {"type": "constant_rate", "sessions_per_second": 1},
+            "stop": {"sessions": 8},
+        },
+    }
+    name = f"{connector}-{'launch' if launch else 'no-launch'}"
+    path = tmp_path / f"{name}.yaml"
+    path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    out = tmp_path / name
+    argv = ["predict", "--stack", "engine", "--config", str(path), "--format", "json"]
+    assert cli.main([*argv, "--capture-per-request", "--output-dir", str(out)]) == 0
+    assert json.loads(capsys.readouterr().out)["completed_requests"] == 32
+    records = [json.loads(line) for line in (out / "requests.jsonl").read_text().splitlines()]
+    return [
+        record["first_token_ms"] - record["arrival_time_ms"]
+        for record in records
+        if (record["first_admission_host_reused_input_tokens"] or 0) > 0
+    ]
+
+
+def test_launch_polls_v0_32_cpu_tier_loads_through_the_real_runtime(tmp_path, capsys) -> None:
+    # Every later turn of each session restores its earlier turns from the CPU
+    # tier. Without `launch`, a restored request joins the first pass decided
+    # after its copy ends with either v0.32 connector. With `launch`, it waits
+    # for vLLM to poll the connector: the offloading copy starts when the
+    # issuing pass's GPU work ends and a later pass sees it, while SimpleCPU's
+    # starts at that pass's launch end and the next pass sees it. Each hit
+    # therefore takes two more 10 ms decode passes with offloading.
+    ttft = {
+        (connector, launch): _polled_cpu_tier_hits_ttft(tmp_path, capsys, connector, launch)
+        for connector in ("offloading_v0_32", "simple_cpu_v0_32")
+        for launch in (False, True)
+    }
+    assert {len(hits) for hits in ttft.values()} == {8}
+    assert ttft[("offloading_v0_32", False)] == ttft[("simple_cpu_v0_32", False)]
+    gaps = {
+        round(offloading - simple, 6)
+        for offloading, simple in zip(ttft[("offloading_v0_32", True)], ttft[("simple_cpu_v0_32", True)], strict=True)
+    }
+    assert gaps == {20.0}
+    assert min(ttft[("simple_cpu_v0_32", True)]) > max(ttft[("simple_cpu_v0_32", False)])
 
 
 def test_kvcr_supports_the_prefill_role_and_rejects_the_decode_role() -> None:

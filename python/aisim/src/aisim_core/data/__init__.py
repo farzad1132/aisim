@@ -20,13 +20,14 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
 from aisim_core.data.fpm_layout import OTHER_CATEGORY_PREFIXES, PHYSICAL_PREFIX, storage_path
 
 Digest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
-Category = Literal["op-latency", "fpm", "e2e", "eval", "systems"]
+Category = Literal["op-latency", "fpm", "e2e", "eval", "systems", "host-cost"]
 Purpose = Literal[
     "operation-tables",
     "execution-profile",
     "e2e-configuration",
     "evaluation-record",
     "system-spec",
+    "host-cost-profile",
 ]
 # Version 1 hashed only the original Identity fields. Version 2 adds the
 # first-class deployment fields below. Version 3 adds the deployment facts that
@@ -344,6 +345,11 @@ def check_dataset(root: Path, *, unchecked_categories: tuple[str, ...] = ()) -> 
 
                 loaded = load_e2e(root, entry.manifest.path).manifest
                 if loaded.model_dump_json() != manifest.model_dump_json():
+                    raise ValueError("manifest changed during dataset validation")
+            elif category == "host-cost":
+                from aisim_core.data.host_cost import check_entry
+
+                if check_entry(root, entry.manifest.path).model_dump_json() != manifest.model_dump_json():
                     raise ValueError("manifest changed during dataset validation")
             else:
                 manifest = _check_manifest(root, manifest)

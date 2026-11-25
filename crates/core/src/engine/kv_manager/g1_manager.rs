@@ -69,6 +69,10 @@ impl StoreSourceSnapshot<'_> {
 }
 
 impl DestinationReservation {
+    pub(crate) fn fresh_source_reads(&self) -> impl Iterator<Item = SourceReuseDependency> + '_ {
+        self.inner.fresh_source_reads()
+    }
+
     pub(crate) fn transferable_prompt_tokens(&self, block_size: usize) -> usize {
         self.inner.transferable_prompt_tokens(block_size)
     }
@@ -496,8 +500,10 @@ impl G1Manager {
     pub(crate) fn satisfy_native_source_dependency(
         &mut self,
         dependency: SourceReuseDependency,
+        retain_source_read: bool,
     ) -> bool {
-        self.inner.satisfy_source_reuse_dependency(dependency)
+        self.inner
+            .satisfy_source_reuse_dependency(dependency, retain_source_read)
     }
 
     pub(crate) fn is_native_source_dependency_pending(
