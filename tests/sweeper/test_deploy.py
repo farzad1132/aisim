@@ -563,3 +563,95 @@ def test_fixed_timing_drops_the_forward_model_field(monkeypatch):
     assert "aic_forward_model" not in deployment.agg_engine_args
     assert deployment.agg_engine_args["timing_model"]["type"] == "fixed"
     assert deployment.performance_model_metadata["aggregated"]["config"]["forward_model"] == "op_level"
+
+
+GEMMA4_TP2 = ReplicaParallelConfig(ParallelShape(tp=2, dp=1, moe_tp=2, moe_ep=1), replicas=1)
+
+
+def _gemma4_deployment(space_overrides=None, **selection):
+    space = _space(
+        model_name="google/gemma-4-26B-A4B",
+        hardware_sku="rtx_pro_6000_server",
+        **(space_overrides or {}),
+    )
+    sample = unroll_sample(
+        search_space=space,
+        selection=_agg_selection(
+            backend="vllm",
+            agg_max_num_batched_tokens=8192,
+            agg_max_num_seqs=256,
+            **selection,
+        ),
+        parallel_config=GEMMA4_TP2,
+    )
+    return build_backend_deployment(sample, backend_version="0.32.0")
+
+
+def test_gemma4_candidate_gets_the_window_state_predict_uses():
+    from aisim import capacity
+
+    engine = _gemma4_deployment().agg_engine_args
+    # TP2 BF16: 128-token global blocks of 10,240 B/token and 85 window blocks of 1,310,720 B.
+    assert (engine["block_size"], engine["kv_cache_bytes_per_token"]) == (128, 10240)
+    assert engine["state_cache"] == {
+        "bytes_per_request": 85 * 1310720,
+        "sliding_window": {"lookahead_tokens": 0},
+    }
+    assert "gpu_memory_utilization" not in engine
+    assert engine["num_gpu_blocks_is_explicit"] is False
+    diagnostics = {}
+    capacity.estimate_num_gpu_blocks(
+        backend_name="vllm",
+        system="rtx_pro_6000_server",
+        model_path="google/gemma-4-26B-A4B",
+        tp_size=2,
+        moe_tp_size=2,
+        block_size=64,
+        max_num_batched_tokens=8192,
+        max_num_sequences=256,
+        gpu_memory_utilization=0.9,
+        backend_version="0.32.0",
+        diagnostics=diagnostics,
+    )
+    # The same byte budget as the uniform candidate, divided into the state pool's blocks.
+    assert engine["num_gpu_blocks"] == diagnostics["total_kv_size_bytes"] // (128 * 10240)
+
+
+def test_gemma4_candidate_rejects_speculation_like_predict():
+    with pytest.raises(ValueError, match="speculative decoding"):
+        _gemma4_deployment({"aic_nextn": 1, "nextn_accepted": 0.8})
+
+
+def test_non_gemma4_vllm_candidate_keeps_the_uniform_pool(monkeypatch):
+    from aisim import compiler
+
+    monkeypatch.setattr(compiler, "_is_gemma4", lambda model: False)
+    engine = _agg_deployment(selection=_agg_selection(backend="vllm")).agg_engine_args
+    assert "state_cache" not in engine
+
+
+def test_gemma4_disagg_transfer_uses_the_prefill_window_token_bytes():
+    parallel = DisaggParallelConfig(
+        prefill=ReplicaParallelConfig(ParallelShape(tp=1, dp=1, moe_tp=1, moe_ep=1), 1),
+        decode=GEMMA4_TP2,
+    )
+    selection = _agg_selection(
+        deployment_mode="disagg",
+        backend="vllm",
+        prefill_max_num_batched_tokens=8192,
+        prefill_max_num_seqs=1,
+        decode_max_num_batched_tokens=8192,
+        decode_max_num_seqs=256,
+    )
+    space = _space(
+        model_name="google/gemma-4-26B-A4B",
+        hardware_sku="rtx_pro_6000_server",
+        kv_transfer_bytes_per_token="auto",
+        kv_transfer_bandwidth=400.0,
+    )
+    sample = unroll_sample(search_space=space, selection=selection, parallel_config=parallel)
+    deployment = build_backend_deployment(sample, backend_version="0.32.0")
+    # Prefill TP1 BF16 global-layer token KV, as predict transfers it; not the all-layer estimate.
+    assert deployment.prefill_engine_args["kv_transfer_bytes_per_token"] == 20480
+    assert deployment.decode_engine_args["kv_transfer_bytes_per_token"] == 20480
+    assert deployment.decode_engine_args["kv_cache_bytes_per_token"] == 10240

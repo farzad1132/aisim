@@ -164,9 +164,13 @@ def estimate_kv_tokens(
     worker_type: str = "aggregated",
     model_controls: dict[str, str | int | bool] | None = None,
     context_length: int | None = None,
+    quantity: str = "total_kv_size_tokens",
 ) -> int | None:
     """Per-rank KV-cache capacity (in tokens) for ``shape``, or ``None`` when the
     shape leaves no KV budget (weights + activations already fill VRAM -> OOM).
+
+    ``quantity="total_kv_size_bytes"`` returns the byte budget instead, which a
+    window-state pool divides by its own block bytes.
 
     Raises :class:`IllegalParallelShape` when the model cannot be split into
     ``shape``. Genuine estimation errors (bad inputs, unsupported model) propagate.
@@ -206,7 +210,7 @@ def estimate_kv_tokens(
         if _TP_DIVISIBILITY.search(msg):
             raise IllegalParallelShape(str(exc.__cause__ or exc).strip()) from exc
         raise
-    return int(est["total_kv_size_tokens"])
+    return int(est[quantity])
 
 
 def feasible_shape_tokens(

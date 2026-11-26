@@ -1242,7 +1242,7 @@ impl PassLaunchConfig {
 pub struct StateCacheConfig {
     /// Bytes occupied by one physical working state or snapshot.
     pub bytes_per_request: usize,
-    /// Present when the state is a sliding window (DeepSeek V4) rather than a
+    /// Present when the state is a sliding window (DeepSeek V4, Gemma 4) rather than a
     /// recurrent state: vLLM can then resume at any retained aligned boundary
     /// the request passed, not only where a step ended.
     #[serde(default, skip_serializing_if = "Option::is_none")]

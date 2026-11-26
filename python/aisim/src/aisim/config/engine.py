@@ -427,7 +427,7 @@ class StateCachePredictionConfig(StrictModel):
     indexer_cache_dtype: IndexerCacheDtype = "auto"
     # vLLM's VLLM_PREFIX_CACHE_RETENTION_INTERVAL; DeepSeek V4 only.
     retention_interval: NonNegativeU64 | None = None
-    # Sizing fills this for DeepSeek V4; authored only beside explicit bytes.
+    # Sizing fills this for DeepSeek V4 (64) and Gemma 4 (0); authored only beside explicit bytes.
     sliding_window_lookahead_tokens: NonNegativeU64 | None = None
 
     def resolved_sliding_window(self) -> dict[str, int] | None:

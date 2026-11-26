@@ -418,6 +418,8 @@ def derive_snapshot_roles(value: dict[str, Any]) -> dict[str, Any]:
         _check_role_identity(value, snapshot)
         _pin_block_size(value, snapshot)
         shape = _pin_parallel_shape(value, snapshot)
+        # After the shape is pinned: an unknown saved width takes the role's explicit value.
+        _reject_window_state_snapshot(snapshot, tp=shape["tp"])
         if snapshot.fitted:
             _check_fitted_shape(snapshot, shape)
             _pin_deployment_limits(value, snapshot)
@@ -468,6 +470,36 @@ def _check_role_identity(value: dict[str, Any], snapshot: SnapshotRole) -> None:
         raise _conflict(
             snapshot, "the vision encoder_parallel", vision.get("encoder_parallel"), identity.get("encoder_parallel")
         )
+
+
+def _reject_window_state_snapshot(snapshot: SnapshotRole, *, tp: int) -> None:
+    """Reject a Gemma 4 vLLM snapshot whose role would run two different KV block sizes.
+
+    vLLM grows the global group's block to match the sliding layers' page (64 to 128 at TP1 and
+    TP2; unchanged at TP4 and above). The window-state pool, and so the estimator's kv_block_size,
+    uses that grown block, while vLLM is launched with the smaller one. A snapshot records a single
+    kv_block_size: an AISim-compiled model saves the pool block, a deployment saves vLLM's requested
+    block, and the value does not say which. Restoring is only safe where the two coincide.
+    """
+    from aisim_core.sdk.memory import estimate_state_cache
+
+    from ..compiler import _is_gemma4
+
+    identity = snapshot.identity
+    if identity["backend"] != "vllm" or not _is_gemma4(str(identity["model"])):
+        return
+    saved = int(identity["kv_block_size"])
+    # Replay runs pipeline 1 only, so the pinned tensor width fixes the block.
+    if (
+        estimate_state_cache(str(identity["model"]), backend="vllm", tp_size=tp, block_size=saved)["block_size"]
+        == saved
+    ):
+        return
+    raise ValueError(
+        f"{snapshot.describe()} cannot time a Gemma 4 vLLM role: at tp={tp} the window-state pool's KV block "
+        f"differs from vLLM's requested block, and the snapshot's kv_block_size={saved} does not record which "
+        "of the two it is"
+    )
 
 
 def _pin_block_size(value: dict[str, Any], snapshot: SnapshotRole) -> None:

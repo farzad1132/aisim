@@ -49,6 +49,7 @@ def _per_rank_capacity_tokens(
     worker_type: str = "aggregated",
     context_length: int | None = None,
     model_controls: tuple[tuple[str, str | int | bool], ...] = (),
+    quantity: str = "total_kv_size_tokens",
 ) -> int:
     tokens = estimate_kv_tokens(
         shape,
@@ -68,6 +69,7 @@ def _per_rank_capacity_tokens(
             else {}
         ),
         **({"model_controls": dict(model_controls)} if model_controls else {}),
+        quantity=quantity,
     )
     if tokens is None:
         raise InfeasibleKVCapacity(
@@ -83,8 +85,12 @@ def _role_capacity_tokens(
     role: str,
     config: ReplicaParallelConfig,
     backend_version: str,
+    budget_bytes: bool = False,
 ) -> int:
-    """Aggregate scheduler-visible KV tokens across attention-DP ranks and replicas."""
+    """Aggregate scheduler-visible KV tokens across attention-DP ranks and replicas.
+
+    ``budget_bytes`` returns one rank's analytical KV byte budget instead (no fixed blocks).
+    """
     from ..config.engine import resolve_block_size
 
     block_size = resolve_block_size(sample["backend"], sample[f"{role}_block_size"])
@@ -146,7 +152,10 @@ def _role_capacity_tokens(
             context_length=sample.get(f"{role}_context_length") or sample.get("context_length"),
             nextn=int(resolved.get("nextn", sample.get("aic_nextn")) or 0),
             model_controls=tuple(model_controls.items()),
+            quantity="total_kv_size_bytes" if budget_bytes else "total_kv_size_tokens",
         )
+        if budget_bytes:
+            return per_rank_tokens
     # Dynamo's AIC estimator returns per-rank blocks. Offline replay models one
     # engine-wide KV pool, so attention-DP ranks contribute independent capacity;
     # tensor/expert parallel ranks shard the same sequences and are not multipliers.
@@ -237,6 +246,50 @@ def _role_grouped_capacity(
     return per_rank_bytes * ranks, per_request_bytes, (per_rank_bytes // per_request_bytes) * ranks
 
 
+def _role_window_capacity(
+    sample: dict[str, Any],
+    *,
+    role: str,
+    config: ReplicaParallelConfig,
+    backend_version: str,
+    request_occupancy_tokens: int,
+) -> tuple[int, int, int] | None:
+    """Gemma 4's window-state pool, as the deployment sizes it: bytes, bytes per request, requests.
+
+    A request holds its global-layer token blocks plus the fixed window state.
+    """
+    from ..config.engine import resolve_block_size
+    from .deploy import gemma4_window_geometry
+
+    window = gemma4_window_geometry(
+        sample,
+        role,
+        resolve_block_size(sample["backend"], sample[f"{role}_block_size"]),
+        backend_version=backend_version,
+    )
+    if window is None:
+        return None
+    block_bytes = int(window["block_size"]) * int(window["kv_bytes_per_token"])
+    fixed_blocks = sample.get(f"{role}_num_gpu_blocks")
+    if fixed_blocks is not None:
+        per_rank_blocks = int(fixed_blocks)
+    elif window["runtime_memory"] is not None:
+        per_rank_blocks = window["runtime_memory"].kv_cache_bytes // block_bytes
+    else:
+        budget = _role_capacity_tokens(
+            sample, role=role, config=config, backend_version=backend_version, budget_bytes=True
+        )
+        per_rank_blocks = budget // block_bytes
+    state_blocks = -(-int(window["bytes_per_request"]) // block_bytes)
+    request_blocks = -(-request_occupancy_tokens // int(window["block_size"])) + state_blocks
+    ranks = config.shape.dp * config.replicas
+    return (
+        per_rank_blocks * block_bytes * ranks,
+        request_blocks * block_bytes,
+        (per_rank_blocks // request_blocks) * ranks,
+    )
+
+
 def resolve_kv_load(
     sample: dict[str, Any],
     *,
@@ -301,8 +354,21 @@ def resolve_kv_load(
             backend_version=backend_version,
             request_occupancy_tokens=expected_tokens_per_request,
         )
+        window = (
+            _role_window_capacity(
+                sample,
+                role=role,
+                config=config,
+                backend_version=backend_version,
+                request_occupancy_tokens=expected_tokens_per_request,
+            )
+            if grouped is None
+            else None
+        )
         if grouped is not None:
             capacity_bytes[role], request_bytes[role], request_capacities[role] = grouped
+        elif window is not None:
+            capacity_bytes[role], request_bytes[role], request_capacities[role] = window
         else:
             capacities[role] = _role_capacity_tokens(
                 sample,

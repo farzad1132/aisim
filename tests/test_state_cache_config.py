@@ -586,7 +586,7 @@ def test_dsv4_draft_tokens_widen_sliding_windows():
         (FLASH, {"mamba_cache_dtype": "float32"}, "Kimi K3 only"),
         (FLASH, {"indexer_cache_dtype": "bfloat16"}, "auto, fp8 or mxfp4"),
         ("moonshotai/Kimi-K3", {"tp_size": 8, "indexer_cache_dtype": "fp8"}, "DeepSeek V4 only"),
-        ("deepseek-ai/DeepSeek-V4.1-Flash", {}, "Kimi K3 and DeepSeek V4"),
+        ("deepseek-ai/DeepSeek-V4.1-Flash", {}, "Kimi K3, DeepSeek V4 and Gemma 4"),
     ],
 )
 def test_dsv4_state_estimator_rejects_unsupported_controls(model, controls, error):
@@ -760,7 +760,7 @@ def test_auto_dsv4_pd_transfers_rows_and_state(auto_dsv4_payload, forbid_estimat
     [
         ({"capacity": {"type": "fixed", "bytes": 4 * 21233664 - 1}}, "capacity must fit"),
         ({"prefix_match_unit": 512}, "divisor"),
-        ({"state_cache": {"retention_interval": 768}}, "requires inferred DeepSeek V4"),
+        ({"state_cache": {"retention_interval": 768}}, "requires an inferred sliding-window geometry"),
         ({"state_cache": {"sliding_window_lookahead_tokens": 64}}, "requires bytes_per_request"),
     ],
 )

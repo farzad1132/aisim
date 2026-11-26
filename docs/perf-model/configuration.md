@@ -1590,6 +1590,18 @@ replay runs only `pipeline: 1`) or context parallelism.
 `engine.estimator_config.state_snapshot` is rejected: a snapshot belongs to one
 role.
 
+A snapshot's `kv_block_size` is the block size its timing model was built with,
+and a restored role runs exactly that block. For most models it is also vLLM's
+`--block-size`. Gemma 4 on vLLM differs: its
+[automatic state cache](../replay/engine/kv-cache.md#gemma-4-on-vllm) runs the
+global group's block, which vLLM grows to match the sliding layers' page (64
+becomes 128 at TP1 and TP2). A model AISim compiles saves that pool block, a
+deployment saves the requested one, and the saved value does not say which.
+A Gemma 4 vLLM snapshot whose block would change when resolved, or whose tensor
+width or `kv_block_size` is unknown, is therefore rejected; at TP4 and above
+both blocks are equal and the snapshot restores. Supporting TP1 and TP2 would
+need the engine and the snapshot to carry both block sizes.
+
 #### Regression and learned snapshots
 
 A Dynamo planner without an `ais_perf_model` role configuration saves an

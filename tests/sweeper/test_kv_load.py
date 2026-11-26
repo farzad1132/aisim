@@ -457,3 +457,36 @@ def test_disagg_prefill_vision_sizes_only_the_prefill_capacity_against_the_tower
     # The runtime deducts the tower and the embedding cache on the prefill rank only.
     assert controls[0] == {"colocated_encoder": True, "reserved_bytes": 100 << 20, "encoder_parallel": "tp"}
     assert "colocated_encoder" not in controls[1]
+
+
+def _gemma4_sample(**overrides) -> dict:
+    sample = _sample("agg")
+    sample.update(model_name="google/gemma-4-26B-A4B", kvcache_quant_mode="fp8", tp=1, pp=1, **overrides)
+    return sample
+
+
+GEMMA4_TP1 = ReplicaParallelConfig(ParallelShape(tp=1, dp=1, moe_tp=1, moe_ep=1), replicas=2)
+
+
+@pytest.mark.parametrize("fixed", [True, False])
+def test_gemma4_capacity_charges_each_request_its_window_state(monkeypatch, fixed):
+    # TP1 FP8: 128-token blocks of 1,310,720 B; each request holds cdiv(3238, 128) = 26 token blocks
+    # plus the 85-block window state, so 45,817 blocks fit 412 requests per rank.
+    if fixed:
+        sample = _gemma4_sample(agg_num_gpu_blocks=45_817)
+    else:
+        sample = _gemma4_sample()
+        monkeypatch.setattr(
+            "aisim.sweeper.kv_load._per_rank_capacity_tokens",
+            lambda *args, quantity, **kwargs: 45_817 * 1_310_720 + 7 if quantity == "total_kv_size_bytes" else 0,
+        )
+    resolution = resolve_kv_load(
+        sample,
+        workload=Workload(isl=3110, osl=256, kv_load_ratio=1.0, request_count=1),
+        parallel_config=GEMMA4_TP1,
+        ratio=1.0,
+        backend_version="0.32.0",
+    )
+    assert resolution.concurrency_capacity == 412 * 2
+    assert resolution.role_request_cache_bytes["agg"] == (26 + 85) * 1_310_720
+    assert resolution.role_capacity_bytes["agg"] == 45_817 * 1_310_720 * 2

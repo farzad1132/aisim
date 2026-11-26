@@ -2311,6 +2311,27 @@ the license is included at the repository root as `LICENSE` and in the Python
 distribution. Upstream license:
 https://github.com/vllm-project/vllm/blob/c5c116138267ac738bc262495326d28ffff834a2/LICENSE
 
+## vLLM Gemma 4 cache sizing
+
+`src/aisim_core/sdk/memory/gemma4.py` is adapted and modified from vLLM
+[`v0.32.0`](https://github.com/vllm-project/vllm/tree/5df63a7203cdb9328d824a27b682e77c7b9928be)
+(commit `5df63a7203cdb9328d824a27b682e77c7b9928be`). Original paths:
+`vllm/v1/core/kv_cache_utils.py` (`unify_kv_cache_spec_page_size`,
+`_get_kv_cache_groups_uniform_page_size`), `vllm/v1/kv_cache_interface.py`
+(`SlidingWindowSpec`) and `vllm/model_executor/models/gemma4.py` (K loaded into
+both cache slots for `attention_k_eq_v` layers). The modified implementation
+computes Gemma 4 cache pages, cache groups and resident sliding-window blocks
+with CPU arithmetic, maps them onto AISim's state cache, and adds AISim
+validation and diagnostics.
+
+Source: https://github.com/vllm-project/vllm/tree/5df63a7203cdb9328d824a27b682e77c7b9928be
+
+Copyright contributors to the vLLM project.
+Licensed under Apache-2.0;
+the license is included at the repository root as `LICENSE` and in the Python
+distribution. Upstream license:
+https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/LICENSE
+
 ## SemiAnalysis AgentX simulation-performance fixture
 
 `python/aisim/tools/simulation_perf_gate/fixtures/agentx.jsonl` is derived

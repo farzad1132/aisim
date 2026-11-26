@@ -85,6 +85,7 @@ CORE_SDK_LEAF_MODULES = [
     "glm53flash",
     "inference_summary",
     "memory.deepseek_v4",
+    "memory.gemma4",
     "memory.kimi_k3",
     "memory.kv_cache",
     "memory.state",

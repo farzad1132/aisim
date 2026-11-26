@@ -1087,7 +1087,12 @@ def _candidate_prediction(
             if role == "prefill"
             else deployment.decode_engine_args
         )
-        if isinstance(role_args, dict) and role_args.get("kv_cache_bytes_per_token") is not None:
+        # Gemma 4's window-state geometry is resolved again by predict, which refuses an explicit value.
+        if (
+            isinstance(role_args, dict)
+            and role_args.get("kv_cache_bytes_per_token") is not None
+            and role_args.get("state_cache") is None
+        ):
             kv_cache["bytes_per_token"] = role_args["kv_cache_bytes_per_token"]
         if sample.get(f"{role}_native_host_offload") is not None:
             kv_cache["host_offload"] = deepcopy(sample[f"{role}_native_host_offload"])

@@ -149,9 +149,16 @@ def _engine_args_payload(
     if sample.get(f"{role}_num_gpu_blocks") is not None:
         payload["num_gpu_blocks"] = int(sample[f"{role}_num_gpu_blocks"])
         payload.pop(memory_fraction_field, None)
+    # As the compiler: vLLM keeps Gemma 4's sliding-window layers as one fixed state per request.
+    window_state = _gemma4_window_state(sample, role, payload, backend_version=backend_version)
+    if window_state is not None:
+        payload.pop(memory_fraction_field, None)
     if sample.get(f"{role}_timing_model") is not None:
         payload["timing_model"] = dict(sample[f"{role}_timing_model"])
-        if sample.get(f"{role}_num_gpu_blocks") is None:
+        if window_state is not None:
+            # Sized before the AIC capacity inputs are dropped below.
+            _size_window_state_pool(payload, sample, role, window_state, memory_fraction)
+        elif sample.get(f"{role}_num_gpu_blocks") is None:
             payload = materialize_aic_num_gpu_blocks(payload)
         for name in (
             "systems_path",
@@ -201,7 +208,20 @@ def _engine_args_payload(
             else int(configured_bytes)
         )
     transfer_geometry = sample.get("kv_transfer_bytes_per_token")
-    if role in {"prefill", "decode"} and transfer_geometry is not None:
+    # As the compiler: a window-state prefill transfers its global-layer token KV.
+    prefill_window = (
+        gemma4_window_geometry(
+            sample,
+            "prefill",
+            resolve_block_size(backend, sample["prefill_block_size"]),
+            backend_version=backend_version,
+        )
+        if role in {"prefill", "decode"} and transfer_geometry == "auto"
+        else None
+    )
+    if prefill_window is not None:
+        payload["kv_transfer_bytes_per_token"] = prefill_window["kv_bytes_per_token"]
+    elif role in {"prefill", "decode"} and transfer_geometry is not None:
         payload["kv_transfer_bytes_per_token"] = (
             estimate_kv_bytes_per_token(
                 str(sample["model_name"]),
@@ -222,7 +242,149 @@ def _engine_args_payload(
             payload["kv_transfer_bandwidth"] = float(sample["kv_transfer_bandwidth"])
         if sample.get("kv_transfer_timing_mode") is not None:
             payload["kv_transfer_timing_mode"] = sample["kv_transfer_timing_mode"]
+    if window_state is not None:
+        # Host offload's all-layer estimate above does not describe this pool.
+        payload["kv_cache_bytes_per_token"] = window_state["kv_bytes_per_token"]
+        if "num_gpu_blocks" not in payload:
+            # The canonical timing config, which the budget probe needs, is complete only now.
+            _size_window_state_pool(payload, sample, role, window_state, memory_fraction)
     return payload
+
+
+def gemma4_window_geometry(
+    sample: dict[str, Any],
+    role: str,
+    block_size: int,
+    *,
+    backend_version: str | None,
+    model: str | None = None,
+    fpm_profile: Any = None,
+) -> dict[str, Any] | None:
+    """Gemma 4's window-state sizing for a candidate role, or ``None`` when it keeps the uniform pool.
+
+    The forward-pass estimator takes its ``kv_block_size`` from here too, so the
+    timing identity and the engine pool agree, as they do in the compiler.
+    """
+    from aisim_core.sdk.memory import estimate_state_cache
+
+    from ..compiler import _is_gemma4
+
+    model = model or str(sample["model_name"])
+    fpm_profile = fpm_profile if fpm_profile is not None else sample.get("fpm_profile")
+    if sample["backend"] != "vllm" or not _is_gemma4(model):
+        return None
+    runtime = None
+    kv_quant_mode = sample.get("kvcache_quant_mode") or None
+    if fpm_profile is not None:
+
+        def recorded_pool(name: str):
+            deployment = _profile_deployment(sample, name, backend_version, model=model, fpm_profile=fpm_profile)
+            resources = deployment.resources
+            # A grouped profile models the window groups itself; one without runtime memory has no pool to divide.
+            if resources is None or resources.cache_layout == "grouped" or resources.runtime_memory is None:
+                return deployment, None
+            return deployment, resources.runtime_memory
+
+        deployment, runtime = recorded_pool(role)
+        # Decode resumes from the transferred state, so both P/D roles take the window state or neither does.
+        peer = {"prefill": "decode", "decode": "prefill"}.get(role)
+        if runtime is None or (peer is not None and recorded_pool(peer)[1] is None):
+            return None
+        # The window is sized at the precision the profile was measured at; an override must match it.
+        deployment.validate_overrides(kvcache_quant_mode=kv_quant_mode)
+        kv_quant_mode = deployment.kv_cache_dtype
+    prefix = _role_prefix(role)
+    state = estimate_state_cache(
+        model,
+        backend="vllm",
+        tp_size=int(sample[f"{prefix}tp"]),
+        pp_size=int(sample[f"{prefix}pp"]),
+        block_size=int(block_size),
+        kvcache_quant_mode=kv_quant_mode,
+    )
+    return {**state, "runtime_memory": runtime}
+
+
+def _gemma4_window_state(
+    sample: dict[str, Any], role: str, payload: dict[str, Any], *, backend_version: str
+) -> dict[str, Any] | None:
+    """Resolve Gemma 4's window state into ``payload``, as ``compiler._resolve_state_cache`` does."""
+    from ..compiler import reject_gemma4_window_conflicts
+
+    state = gemma4_window_geometry(sample, role, int(payload["block_size"]), backend_version=backend_version)
+    if state is None:
+        return None
+    host_offload = sample.get(f"{role}_native_host_offload")
+    reject_gemma4_window_conflicts(
+        g3_offload=False,
+        kvcr=False,
+        host_connector=host_offload.get("connector", "offloading_v0_24") if host_offload is not None else None,
+        speculative=sample.get("speculation") is not None or bool(sample.get("aic_nextn")),
+        explicit_bytes_per_token=sample.get(f"{role}_kv_bytes_per_token", "auto") not in (None, "auto"),
+    )
+    payload.update(
+        block_size=state["block_size"],
+        kv_cache_bytes_per_token=state["kv_bytes_per_token"],
+        state_cache={"bytes_per_request": state["bytes_per_request"], "sliding_window": {"lookahead_tokens": 0}},
+    )
+    return state
+
+
+def _size_window_state_pool(
+    payload: dict[str, Any], sample: dict[str, Any], role: str, state: dict[str, Any], memory_fraction: float
+) -> None:
+    from ..state_size import analytical_memory_blocks
+
+    if sample.get(f"{role}_num_gpu_blocks") is not None:
+        return
+    block_bytes = int(state["block_size"]) * int(state["kv_bytes_per_token"])
+    runtime = state["runtime_memory"]
+    if runtime is not None:
+        # The checks predict's recorded_state_pool makes: the pool was recorded at one memory
+        # fraction and context limit, by a deployment without context parallelism.
+        prefix = _role_prefix(role)
+        if (sample.get(f"{prefix}cp") or 1) != 1 or (sample.get(f"{prefix}dcp") or 1) != 1:
+            raise ValueError("a recorded state pool requires parallelism prefill_context=1 and decode_context=1")
+        if float(memory_fraction) != runtime.gpu_memory_utilization:
+            raise ValueError(
+                "kv_cache.capacity.memory_fraction must match the FPM profile's recorded "
+                f"runtime_memory.gpu_memory_utilization ({runtime.gpu_memory_utilization})"
+            )
+        context = sample.get(f"{role}_context_length") or sample.get("context_length")
+        if context is not None and int(context) > runtime.max_model_len:
+            raise ValueError(
+                "context_length exceeds the FPM profile's recorded runtime_memory.max_model_len "
+                f"({runtime.max_model_len})"
+            )
+        payload["num_gpu_blocks"] = runtime.kv_cache_bytes // block_bytes
+    else:
+        payload["num_gpu_blocks"] = analytical_memory_blocks(
+            payload,
+            backend="vllm",
+            memory_fraction=float(memory_fraction),
+            cuda_graph_reserved_bytes=0,
+            block_bytes=block_bytes,
+        )
+    # Derived from memory, so the runner must not treat it as a user-fixed capacity.
+    payload["num_gpu_blocks_is_explicit"] = False
+
+
+def _profile_deployment(sample: dict[str, Any], role: str, backend_version: str | None, *, model: str, fpm_profile):
+    from aisim_core.sdk.fpm_profile import load_fpm_profile
+
+    prefix = _role_prefix(role)
+    return load_fpm_profile(fpm_profile).select(
+        model=model,
+        system=_role_hardware_sku(sample, role),
+        backend=str(sample["backend"]),
+        backend_version=backend_version,
+        worker_type="aggregated" if role == "agg" else role,
+        tp_size=int(sample[f"{prefix}tp"]),
+        pp_size=int(sample[f"{prefix}pp"]),
+        attention_dp_size=int(sample[f"{prefix}attention_dp"]),
+        moe_tp_size=int(sample[f"{prefix}moe_tp"]),
+        moe_ep_size=int(sample[f"{prefix}moe_ep"]),
+    )
 
 
 def _add_grouped_prefix_caching(payload: dict[str, Any], sample: dict[str, Any], *, backend_version: str) -> None:

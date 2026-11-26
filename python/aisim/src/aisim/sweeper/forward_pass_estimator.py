@@ -148,6 +148,19 @@ class ForwardPassEstimatorResolver:
         block_size = sample[f"{role}_block_size"]
         if block_size is None:
             block_size = _DEFAULT_BLOCK_SIZE[backend]
+        # Gemma 4 on vLLM runs the window-state pool's resolved block, as the deployment does.
+        from .deploy import gemma4_window_geometry
+
+        window = gemma4_window_geometry(
+            sample,
+            role,
+            int(block_size),
+            backend_version=self._search_space.requested_backend_version(backend),
+            model=self._search_space.model_name,
+            fpm_profile=self._search_space.fpm_profile,
+        )
+        if window is not None:
+            block_size = window["block_size"]
         transfer_policy: Any = self._search_space.transfer_policy
         if isinstance(transfer_policy, list):
             transfer_policy = tuple(transfer_policy)

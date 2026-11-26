@@ -49,6 +49,7 @@
 /crates/core/src/perfmodel/                            @ai-dynamo/aisim-forward-pass-engine-codeowners
 /crates/core/tests/perfmodel/                          @ai-dynamo/aisim-forward-pass-engine-codeowners
 /tests/test_fpm_query_evidence.py                      @ai-dynamo/aisim-forward-pass-engine-codeowners
+/tests/test_gemma4_state_cache.py                      @ai-dynamo/aisim-forward-pass-engine-codeowners
 /python/aisim/src/aisim_core/data/                     @ai-dynamo/aisim-forward-pass-engine-codeowners
 /python/aisim/src/aisim/capacity.py                    @ai-dynamo/aisim-forward-pass-engine-codeowners
 /tests/test_fpm_grouped_workflow.py                    @ai-dynamo/aisim-forward-pass-engine-codeowners
@@ -256,6 +257,7 @@
 /tests/test_benchmark_features.py                      @ai-dynamo/aisim-forward-pass-engine-codeowners @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-infra-codeowners @ai-dynamo/access-aisim-maintain
 /tests/test_e2e_accuracy_trust.py                      @ai-dynamo/aisim-infra-codeowners @ai-dynamo/access-aisim-maintain
 /tests/test_fpm_query_evidence.py                      @ai-dynamo/aisim-forward-pass-engine-codeowners @ai-dynamo/aisim-replay-codeowners @ai-dynamo/access-aisim-maintain
+/tests/test_gemma4_state_cache.py                      @ai-dynamo/aisim-forward-pass-engine-codeowners @ai-dynamo/aisim-replay-codeowners @ai-dynamo/access-aisim-maintain
 /tests/test_resource_scheduler.py                      @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-sweeper-codeowners @ai-dynamo/access-aisim-maintain
 /tests/test_state_cache_config.py                      @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-mocker-codeowners @ai-dynamo/access-aisim-maintain
 /docs/reference/local-resources.md                     @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-sweeper-codeowners @ai-dynamo/access-aisim-maintain
